@@ -54,14 +54,6 @@ function refreshStatus() {
           <td>${t.phase || '—'}</td>
         </tr>
       `).join('') || '<tr><td colspan="11">No recent tags (same window as API dedupe)</td></tr>';
-      const diag = data.reader_diagnostics || {};
-      if ($('nav_diag_firmware')) {
-        $('nav_diag_firmware').textContent = diag.firmware || '—';
-        $('nav_diag_temp').textContent = diag.temperature || '—';
-        $('nav_diag_antenna').textContent = diag.work_antenna != null ? diag.work_antenna : '—';
-        $('nav_diag_power').textContent = diag.output_power || '—';
-        $('nav_diag_region').textContent = diag.frequency_region || '—';
-      }
     })
     .catch(() => {});
 }
@@ -115,28 +107,6 @@ function stopRace() {
     })
     .catch(function(err) { showError(err.message); refreshStatus(); });
 }
-function updateNavDiagnostics(d) {
-  if (!$('nav_diag_firmware')) return;
-  $('nav_diag_firmware').textContent = d.firmware ?? '—';
-  $('nav_diag_temp').textContent = d.temperature ?? '—';
-  $('nav_diag_antenna').textContent = d.work_antenna != null ? String(d.work_antenna) : '—';
-  $('nav_diag_power').textContent = d.output_power ?? '—';
-  $('nav_diag_region').textContent = d.frequency_region ?? '—';
-}
-function refreshDiagnostics() {
-  fetch('/api/reader-get-diagnostics', { method: 'POST' })
-    .then(r => r.json().then(data => ({ ok: r.ok, data })))
-    .then(function(result) {
-      const data = result.data;
-      if (!result.ok) showError(data.error || 'Diagnostics failed');
-      updateNavDiagnostics(data.diagnostics || {});
-      refreshStatus();
-    })
-    .catch(function(err) {
-      showError(err.message || 'Network error');
-      refreshStatus();
-    });
-}
 function loadRaces() {
   fetch('/api/available-races').then(r => r.json()).then(data => {
     const sel = $('race_select');
@@ -158,8 +128,6 @@ document.addEventListener('DOMContentLoaded', function() {
   refreshStatus();
   loadRaces();
   statusInterval = setInterval(refreshStatus, 1000);
-  setInterval(refreshDiagnostics, 30000);
-  setTimeout(refreshDiagnostics, 500);
   $('race_select').addEventListener('change', selectRace);
 });
 </script>

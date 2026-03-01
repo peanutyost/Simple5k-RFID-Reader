@@ -1,5 +1,32 @@
 {% extends "base.html" %}
 {% block title %}Settings{% endblock %}
+{% block head %}
+<script>
+function $(id) { return document.getElementById(id); }
+function refreshDiagnostics() {
+  var btn = $('diag_refresh_btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Refreshing…'; }
+  fetch('/api/reader-get-diagnostics', { method: 'POST' })
+    .then(function(r) { return r.json().then(function(data) { return { ok: r.ok, data: data }; }); })
+    .then(function(result) {
+      var d = (result.data && result.data.diagnostics) || {};
+      if ($('diag_firmware')) $('diag_firmware').textContent = d.firmware != null ? d.firmware : '—';
+      if ($('diag_temp')) $('diag_temp').textContent = d.temperature != null ? d.temperature : '—';
+      if ($('diag_antenna')) $('diag_antenna').textContent = d.work_antenna != null ? String(d.work_antenna) : '—';
+      if ($('diag_power')) $('diag_power').textContent = d.output_power != null ? d.output_power : '—';
+      if ($('diag_region')) $('diag_region').textContent = d.frequency_region != null ? d.frequency_region : '—';
+      if ($('diag_error')) $('diag_error').textContent = result.ok ? '' : (result.data && result.data.error) || 'Failed';
+      if ($('diag_error')) $('diag_error').className = result.ok ? '' : 'status-err';
+    })
+    .catch(function() {
+      if ($('diag_error')) { $('diag_error').textContent = 'Network error'; $('diag_error').className = 'status-err'; }
+    })
+    .finally(function() {
+      if (btn) { btn.disabled = false; btn.textContent = 'Refresh diagnostics'; }
+    });
+}
+</script>
+{% endblock %}
 {% block content %}
 <div class="card">
   <h2>Settings</h2>
@@ -35,5 +62,19 @@
 
     <p><button type="submit">Save</button></p>
   </form>
+</div>
+
+<div class="card">
+  <h3>Reader diagnostics</h3>
+  <p>Connect to the reader first, then click Refresh to read firmware, temperature, antenna, power, and frequency.</p>
+  <p class="row" style="gap: 0.5rem 1.5rem;">
+    <span>Firmware: <strong id="diag_firmware">—</strong></span>
+    <span>Temperature: <strong id="diag_temp">—</strong></span>
+    <span>Work antenna: <strong id="diag_antenna">—</strong></span>
+    <span>Output power: <strong id="diag_power">—</strong></span>
+    <span>Frequency: <strong id="diag_region">—</strong></span>
+    <button type="button" class="btn btn-sm" id="diag_refresh_btn" onclick="refreshDiagnostics()">Refresh diagnostics</button>
+  </p>
+  <p id="diag_error" class="status-err" style="margin:0;"></p>
 </div>
 {% endblock %}

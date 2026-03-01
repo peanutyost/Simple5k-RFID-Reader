@@ -512,7 +512,6 @@ def api_status():
         "last_upload_error": last_upload_error,
         "last_webhook_error": last_webhook_error,
         "server_time_utc": _utc_now_iso(),
-        "reader_diagnostics": reader_diagnostics,
         "api_configured": api_configured,
     })
 
@@ -707,6 +706,8 @@ def api_reader_diagnostics():
     with _state_lock:
         if not reader_client or not connected:
             return jsonify({"error": "Not connected"}), 400
+        if reading:
+            return jsonify({"error": "Stop reading first to refresh diagnostics"}), 400
         client = reader_client
     # Brief pause so receive thread can process any in-flight data, then delays between get commands
     time.sleep(0.15)
@@ -761,6 +762,8 @@ def api_reader_diagnostics_debug():
     with _state_lock:
         if not reader_client or not connected:
             return jsonify({"error": "Not connected", "payload_hex": None}), 400
+        if reading:
+            return jsonify({"error": "Stop reading first", "payload_hex": None}), 400
         client = reader_client
     time.sleep(0.1)
     raw_payload, err_code = client.get_firmware_version_raw()
