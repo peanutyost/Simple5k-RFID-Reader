@@ -76,7 +76,20 @@ function stopRace() {
   fetch('/api/stop-race', { method: 'POST' }).then(r => r.json()).then(() => refreshStatus());
 }
 function refreshDiagnostics() {
-  fetch('/api/reader-get-diagnostics', { method: 'POST' }).then(r => r.json()).then(() => refreshStatus());
+  fetch('/api/reader-get-diagnostics', { method: 'POST' })
+    .then(r => r.json())
+    .then(data => {
+      if (data.diagnostics) {
+        const d = data.diagnostics;
+        $('diag_firmware').textContent = d.firmware ?? '—';
+        $('diag_temperature').textContent = d.temperature ?? '—';
+        $('diag_antenna').textContent = d.work_antenna != null ? d.work_antenna : '—';
+        $('diag_power').textContent = d.output_power ?? '—';
+        $('diag_region').textContent = d.frequency_region ?? '—';
+      }
+      refreshStatus();
+    })
+    .catch(() => refreshStatus());
 }
 function loadRaces() {
   fetch('/api/available-races').then(r => r.json()).then(data => {
@@ -109,9 +122,9 @@ document.addEventListener('DOMContentLoaded', function() {
   <p id="api_configured_note" class="row" style="display:none; background:#f8f4e6; padding:0.4rem 0.6rem; border-radius:4px;">API not configured — set Base URL and API key in <a href="{{ url_for('settings') }}">Settings</a> to upload laps and use race start/stop.</p>
   <p class="row"><span class="clock">System clock (UTC): <strong id="server_time_utc">—</strong></span></p>
   <p class="row">
-    <span>Reader connected: <strong id="connected">—</strong></span>
-    <span style="margin-left:1rem">Reading: <strong id="reading">—</strong></span>
-    <span style="margin-left:1rem">Selected race: <strong id="selected_race">—</strong></span>
+    <span>Connected: <strong id="connected">—</strong></span>
+    <span>Reading: <strong id="reading">—</strong></span>
+    <span>Race: <strong id="selected_race">—</strong></span>
   </p>
   <p class="row">
     <button onclick="connect()">Connect</button>
@@ -134,12 +147,12 @@ document.addEventListener('DOMContentLoaded', function() {
 <div class="card">
   <h3>Reader diagnostics</h3>
   <p class="row">
-    Firmware: <span id="diag_firmware">—</span>
-    Temperature: <span id="diag_temperature">—</span>
-    Work antenna: <span id="diag_antenna">—</span>
-    Output power: <span id="diag_power">—</span>
-    Freq region: <span id="diag_region">—</span>
-    <button onclick="refreshDiagnostics()">Refresh</button>
+    <span>Firmware: <span id="diag_firmware">—</span></span>
+    <span>Temp: <span id="diag_temperature">—</span></span>
+    <span>Ant: <span id="diag_antenna">—</span></span>
+    <span>Power: <span id="diag_power">—</span></span>
+    <span>Freq: <span id="diag_region">—</span></span>
+    <button type="button" onclick="refreshDiagnostics()">Refresh</button>
   </p>
 </div>
 
