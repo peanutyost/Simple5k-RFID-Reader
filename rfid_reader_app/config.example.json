@@ -1,16 +1,1 @@
-{
-  "api_base_url": "",
-  "api_key": "",
-  "reader_host": "192.168.1.100",
-  "reader_port": 6000,
-  "reader_id": 0,
-  "reader_work_antenna": 0,
-  "reader_antennas": "",
-  "reader_fast_switch_stay_ms": 1,
-  "reader_fast_switch_interval_ms": 0,
-  "reader_fast_switch_repeat": 0,
-  "webhook_url": "",
-  "webhook_secret_header": "",
-  "max_upload_queue_time_seconds": 3,
-  "api_dedupe_timeout_seconds": 10
-}
+{"api_base_url":"","api_key":"","reader_host":"192.168.1.100","reader_port":6000,"reader_id":0,"reader_work_antenna":0,"reader_antennas":"","reader_fast_switch_stay_ms":1,"reader_fast_switch_interval_ms":0,"reader_fast_switch_repeat":0,"webhook_url":"","webhook_secret_header":"","tag_idle_before_stage_seconds":2,"max_staged_queue_time_seconds":5,"max_staged_queue_size":50,"max_upload_queue_time_seconds":3,"api_dedupe_timeout_seconds":10}

@@ -20,16 +20,22 @@ function refreshStatus() {
       $('connected').className = data.connected ? 'status-ok' : 'status-err';
       $('reading').textContent = data.reading ? 'Yes' : 'No';
       $('reading').className = data.reading ? 'status-ok' : '';
-      $('last_error').textContent = data.last_error || '—';
+      var err = data.last_error || '';
+      var el = $('last_error');
+      if (el) {
+        if (err) { el.textContent = err; el.className = 'status-err'; }
+        else if (Date.now() - lastErrorShownAt > 3000) { el.textContent = '—'; el.className = ''; }
+      }
       $('last_upload_error').textContent = data.last_upload_error || '—';
       $('last_webhook_error').textContent = data.last_webhook_error || '—';
-      $('last_error').className = data.last_error ? 'status-err' : '';
       $('last_upload_error').className = data.last_upload_error ? 'status-err' : '';
       $('last_webhook_error').className = data.last_webhook_error ? 'status-err' : '';
       const race = data.selected_race;
       $('selected_race').textContent = race ? (race.name || 'Race #' + race.id) : '—';
-      const apiNote = $('api_configured_note');
-      if (apiNote) apiNote.style.display = data.api_configured !== false ? 'none' : 'block';
+      const connectBtn = $('connect_btn');
+      if (connectBtn) { connectBtn.textContent = data.connected ? 'Disconnect' : 'Connect'; connectBtn.onclick = data.connected ? disconnect : connect; }
+      const readingBtn = $('reading_btn');
+      if (readingBtn) { readingBtn.textContent = data.reading ? 'Stop reading' : 'Start reading'; readingBtn.onclick = data.reading ? stopReading : startReading; }
       const tags = data.recent_tags || [];
       const tbody = $('tag_table_body');
       const formatDelta = (d) => d == null ? '—' : (d >= 0 ? '+' : '') + d.toFixed(3) + 's';
@@ -49,47 +55,87 @@ function refreshStatus() {
         </tr>
       `).join('') || '<tr><td colspan="11">No recent tags (same window as API dedupe)</td></tr>';
       const diag = data.reader_diagnostics || {};
-      $('diag_firmware').textContent = diag.firmware || '—';
-      $('diag_temperature').textContent = diag.temperature || '—';
-      $('diag_antenna').textContent = diag.work_antenna != null ? diag.work_antenna : '—';
-      $('diag_power').textContent = diag.output_power || '—';
-      $('diag_region').textContent = diag.frequency_region || '—';
+      if ($('nav_diag_firmware')) {
+        $('nav_diag_firmware').textContent = diag.firmware || '—';
+        $('nav_diag_temp').textContent = diag.temperature || '—';
+        $('nav_diag_antenna').textContent = diag.work_antenna != null ? diag.work_antenna : '—';
+        $('nav_diag_power').textContent = diag.output_power || '—';
+        $('nav_diag_region').textContent = diag.frequency_region || '—';
+      }
     })
     .catch(() => {});
 }
+var lastErrorShownAt = 0;
+function showError(msg) {
+  const el = $('last_error');
+  if (el) { el.textContent = msg || '—'; el.className = msg ? 'status-err' : ''; if (msg) lastErrorShownAt = Date.now(); }
+}
 function connect() {
-  fetch('/api/connect', { method: 'POST' }).then(r => r.json()).then(() => refreshStatus());
+  fetch('/api/connect', { method: 'POST' })
+    .then(async function(r) {
+      const data = await r.json().catch(function() { return {}; });
+      if (!r.ok) showError(data.error || ('Error ' + r.status));
+      refreshStatus();
+    })
+    .catch(function(err) { showError(err.message || 'Network error'); refreshStatus(); });
 }
 function disconnect() {
-  fetch('/api/disconnect', { method: 'POST' }).then(r => r.json()).then(() => refreshStatus());
+  fetch('/api/disconnect', { method: 'POST' })
+    .then(function(r) { return r.json().catch(function() { return {}; }); })
+    .then(function(data) { if (data.error) showError(data.error); refreshStatus(); })
+    .catch(function(err) { showError(err.message); refreshStatus(); });
 }
 function startReading() {
-  fetch('/api/start-reading', { method: 'POST' }).then(r => r.json()).then(() => refreshStatus());
+  fetch('/api/start-reading', { method: 'POST' })
+    .then(async function(r) {
+      const data = await r.json().catch(function() { return {}; });
+      if (!r.ok) showError(data.error || ('Error ' + r.status));
+      refreshStatus();
+    })
+    .catch(function(err) { showError(err.message); refreshStatus(); });
 }
 function stopReading() {
   fetch('/api/stop-reading', { method: 'POST' }).then(r => r.json()).then(() => refreshStatus());
 }
 function startRace() {
-  fetch('/api/start-race', { method: 'POST' }).then(r => r.json()).then(() => refreshStatus());
+  fetch('/api/start-race', { method: 'POST' })
+    .then(async function(r) {
+      const data = await r.json().catch(function() { return {}; });
+      if (!r.ok) showError(data.error || ('Error ' + r.status));
+      refreshStatus();
+    })
+    .catch(function(err) { showError(err.message); refreshStatus(); });
 }
 function stopRace() {
-  fetch('/api/stop-race', { method: 'POST' }).then(r => r.json()).then(() => refreshStatus());
+  fetch('/api/stop-race', { method: 'POST' })
+    .then(async function(r) {
+      const data = await r.json().catch(function() { return {}; });
+      if (!r.ok) showError(data.error || ('Error ' + r.status));
+      refreshStatus();
+    })
+    .catch(function(err) { showError(err.message); refreshStatus(); });
+}
+function updateNavDiagnostics(d) {
+  if (!$('nav_diag_firmware')) return;
+  $('nav_diag_firmware').textContent = d.firmware ?? '—';
+  $('nav_diag_temp').textContent = d.temperature ?? '—';
+  $('nav_diag_antenna').textContent = d.work_antenna != null ? String(d.work_antenna) : '—';
+  $('nav_diag_power').textContent = d.output_power ?? '—';
+  $('nav_diag_region').textContent = d.frequency_region ?? '—';
 }
 function refreshDiagnostics() {
   fetch('/api/reader-get-diagnostics', { method: 'POST' })
-    .then(r => r.json())
-    .then(data => {
-      if (data.diagnostics) {
-        const d = data.diagnostics;
-        $('diag_firmware').textContent = d.firmware ?? '—';
-        $('diag_temperature').textContent = d.temperature ?? '—';
-        $('diag_antenna').textContent = d.work_antenna != null ? d.work_antenna : '—';
-        $('diag_power').textContent = d.output_power ?? '—';
-        $('diag_region').textContent = d.frequency_region ?? '—';
-      }
+    .then(r => r.json().then(data => ({ ok: r.ok, data })))
+    .then(function(result) {
+      const data = result.data;
+      if (!result.ok) showError(data.error || 'Diagnostics failed');
+      updateNavDiagnostics(data.diagnostics || {});
       refreshStatus();
     })
-    .catch(() => refreshStatus());
+    .catch(function(err) {
+      showError(err.message || 'Network error');
+      refreshStatus();
+    });
 }
 function loadRaces() {
   fetch('/api/available-races').then(r => r.json()).then(data => {
@@ -111,7 +157,9 @@ function selectRace() {
 document.addEventListener('DOMContentLoaded', function() {
   refreshStatus();
   loadRaces();
-  statusInterval = setInterval(refreshStatus, 1500);
+  statusInterval = setInterval(refreshStatus, 1000);
+  setInterval(refreshDiagnostics, 30000);
+  setTimeout(refreshDiagnostics, 500);
   $('race_select').addEventListener('change', selectRace);
 });
 </script>
@@ -119,40 +167,21 @@ document.addEventListener('DOMContentLoaded', function() {
 {% block content %}
 <div class="card">
   <h2>Dashboard</h2>
-  <p id="api_configured_note" class="row" style="display:none; background:#f8f4e6; padding:0.4rem 0.6rem; border-radius:4px;">API not configured — set Base URL and API key in <a href="{{ url_for('settings') }}">Settings</a> to upload laps and use race start/stop.</p>
-  <p class="row"><span class="clock">System clock (UTC): <strong id="server_time_utc">—</strong></span></p>
-  <p class="row">
+  <p class="row"><span class="clock">UTC: <strong id="server_time_utc">—</strong></span></p>
+  <p class="row" style="gap: 0.75rem 1.25rem;">
     <span>Connected: <strong id="connected">—</strong></span>
     <span>Reading: <strong id="reading">—</strong></span>
     <span>Race: <strong id="selected_race">—</strong></span>
+    <button class="btn-sm" id="connect_btn" onclick="connect()">Connect</button>
+    <button class="btn-sm" id="reading_btn" onclick="startReading()">Start reading</button>
+    <label style="margin:0;">Race: <select id="race_select"></select></label>
+    <button class="btn-sm" onclick="startRace()">Start race</button>
+    <button class="btn-sm" onclick="stopRace()">Stop race</button>
   </p>
-  <p class="row">
-    <button onclick="connect()">Connect</button>
-    <button onclick="disconnect()">Disconnect</button>
-    <button onclick="startReading()">Start reading</button>
-    <button onclick="stopReading()">Stop reading</button>
-  </p>
-  <p class="row">
-    <label>Race: <select id="race_select"></select></label>
-    <button onclick="startRace()">Start Race</button>
-    <button onclick="stopRace()">Stop Race</button>
-  </p>
-  <p class="row">
+  <p class="row" style="margin-top: 0.5rem;">
     <span>Last error: <span id="last_error">—</span></span>
-    <span style="margin-left:1rem">Upload: <span id="last_upload_error">—</span></span>
-    <span style="margin-left:1rem">Webhook: <span id="last_webhook_error">—</span></span>
-  </p>
-</div>
-
-<div class="card">
-  <h3>Reader diagnostics</h3>
-  <p class="row">
-    <span>Firmware: <span id="diag_firmware">—</span></span>
-    <span>Temp: <span id="diag_temperature">—</span></span>
-    <span>Ant: <span id="diag_antenna">—</span></span>
-    <span>Power: <span id="diag_power">—</span></span>
-    <span>Freq: <span id="diag_region">—</span></span>
-    <button type="button" onclick="refreshDiagnostics()">Refresh</button>
+    <span>Upload: <span id="last_upload_error">—</span></span>
+    <span>Webhook: <span id="last_webhook_error">—</span></span>
   </p>
 </div>
 

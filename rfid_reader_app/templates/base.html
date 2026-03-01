@@ -13,6 +13,7 @@
         button, .btn { background: #0f3460; color: #eee; border: 1px solid #6cb4ee; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; text-decoration: none; display: inline-block; font-size: 1rem; }
         button:hover, .btn:hover { background: #1a4a7a; }
         button:disabled { opacity: 0.5; cursor: not-allowed; }
+        button.btn-sm, .btn.btn-sm { padding: 0.25rem 0.5rem; font-size: 0.85rem; }
         input, select { padding: 0.4rem; border-radius: 4px; border: 1px solid #444; background: #0f3460; color: #eee; }
         table { width: 100%; border-collapse: collapse; }
         th, td { padding: 0.5rem; text-align: left; border-bottom: 1px solid #333; }
@@ -20,8 +21,11 @@
         .status-ok { color: #6bcb6b; }
         .status-err { color: #f87171; }
         .clock { font-size: 1.2rem; font-family: monospace; }
-        nav { margin-bottom: 0.5rem; padding: 0.25rem 0; gap: 0.5rem; }
+        nav { margin-bottom: 0.5rem; padding: 0.25rem 0; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
         nav .btn { padding: 0.3rem 0.6rem; font-size: 0.9rem; }
+        .nav-diag { font-size: 0.85rem; color: #aaa; margin-left: 0.5rem; }
+        .nav-diag .diag-item { margin-left: 1rem; }
+        .nav-diag .diag-item:first-child { margin-left: 0; }
     </style>
     {% block head %}{% endblock %}
 </head>
@@ -29,6 +33,14 @@
     <nav class="row" style="margin-bottom:0.5rem;">
         <a href="{{ url_for('index') }}" class="btn">Dashboard</a>
         <a href="{{ url_for('settings') }}" class="btn">Settings</a>
+        <span class="nav-diag">
+            <span class="diag-item">Firmware: <span id="nav_diag_firmware">—</span></span>
+            <span class="diag-item">Temp: <span id="nav_diag_temp">—</span></span>
+            <span class="diag-item">Ant: <span id="nav_diag_antenna">—</span></span>
+            <span class="diag-item">Power: <span id="nav_diag_power">—</span></span>
+            <span class="diag-item">Freq: <span id="nav_diag_region">—</span></span>
+            <button type="button" class="btn btn-sm" id="nav_diag_update_btn" onclick="typeof refreshDiagnostics === 'function' && refreshDiagnostics()" style="margin-left: 0.5rem;">Update</button>
+        </span>
     </nav>
     {% block content %}{% endblock %}
 </body>

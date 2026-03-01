@@ -1,14 +1,17 @@
 """
-UHF RFID reader protocol (binary frame format from Manuels C# demo).
-Frame: 0xA0, len, read_id, cmd, [data...], checksum
-Checksum: ((~sum(bytes[0:-1])) + 1) & 0xFF
+UHF RFID reader protocol per YR8900 Communication Interface Specification.
+Frame: 0xA0, Len, Address (read_id), Cmd, [data...], Check
+- Len = number of bytes after Len (Address + Cmd + data + Check).
+- Check: two's complement of sum of bytes [0:-1] low byte: ((~sum) + 1) & 0xFF.
 """
 import socket
 import threading
-import struct
+import time
 from dataclasses import dataclass, field
-from typing import Callable, Optional, List, Tuple
+from typing import Callable, Optional, List, Tuple, Union
 from queue import Queue, Empty
+
+READ_ID_LEN_12 = 12
 
 
 def checksum(data: bytes) -> int:
@@ -17,19 +20,21 @@ def checksum(data: bytes) -> int:
     return ((~s) + 1) & 0xFF
 
 
-def build_frame(read_id: int, cmd: int, payload: bytes = b"") -> bytes:
-    """Build full frame: 0xA0, len, read_id, cmd, payload..., checksum. len = 3 + len(payload)."""
-    body = bytes([read_id & 0xFF, cmd & 0xFF]) + payload
-    length = len(body)  # number of bytes after the length byte
+def build_frame(read_id: bytes, cmd: int, payload: bytes = b"") -> bytes:
+    """Build frame per spec: Head 0xA0, Len (bytes after Len), Address, Cmd, data..., Check."""
+    body = read_id + bytes([cmd & 0xFF]) + payload
+    length = len(body) + 1  # Len = Address + Cmd + payload + Check
     frame = bytes([0xA0, length & 0xFF]) + body
     frame += bytes([checksum(frame)])
     return frame
 
 
-def parse_frames(buffer: bytearray) -> List[Tuple[int, int, bytes]]:
+def parse_frames(buffer: bytearray, read_id_len: int = 1) -> List[Tuple[bytes, int, bytes]]:
     """
-    Scan buffer for 0xA0 frames. Yield (read_id, cmd, payload) for each complete frame.
+    Scan buffer for 0xA0 frames. read_id_len is 1 or 12. Yield (read_id, cmd, payload).
     Remove consumed bytes from buffer.
+    Supports two length conventions: L = bytes after length (incl. checksum), or L+1 if reader
+    sends L = data only (excl. readId, cmd, checksum).
     """
     result = []
     while True:
@@ -42,16 +47,27 @@ def parse_frames(buffer: bytearray) -> List[Tuple[int, int, bytes]]:
         if len(buffer) < 2:
             break
         length = buffer[1]
-        need = 2 + length + 1  # hdr+len + payload+read_id+cmd + checksum
-        if len(buffer) < need:
-            break
-        packet = bytes(buffer[:need])
-        del buffer[:need]
-        if checksum(packet[:-1]) != packet[-1]:
+        # A: per YR8900 spec, Len = bytes after Len (incl. Check) -> packet = 2 + length
+        # B/C: alternate conventions for other firmware
+        need_a = 2 + length
+        need_b = 3 + length
+        need_c = 5 + length
+        packet = None
+        for need in (need_a, need_b, need_c):
+            if len(buffer) >= need:
+                cand = bytes(buffer[:need])
+                if checksum(cand[:-1]) == cand[-1]:
+                    packet = cand
+                    del buffer[:need]
+                    break
+        if packet is None:
+            del buffer[:1]
             continue
-        read_id = packet[2]
-        cmd = packet[3]
-        payload = packet[4:-1]
+        body_len = len(packet) - 3
+        id_len = read_id_len if (read_id_len in (1, READ_ID_LEN_12) and body_len >= read_id_len + 2) else 1
+        read_id = packet[2 : 2 + id_len]
+        cmd = packet[2 + id_len]
+        payload = packet[2 + id_len + 1 : -1]
         result.append((read_id, cmd, payload))
     return result
 
@@ -70,10 +86,10 @@ class TagRead:
 
 
 def _parse_freq_ant(freq_ant: int, rssi_raw: int, ant_group: int = 0) -> Tuple[float, int]:
-    """Freq (MHz) and antenna number (1-8 or 1-16). ant_group 0 -> 1-8, 1 -> 9-16."""
+    """Per spec: FreqAnt high 6 bits = frequency, low 2 = ant; RSSI high bit => Ant 5/6/7/8 (else 1/2/3/4)."""
     freq = (freq_ant >> 2) & 0x3F
     ant_low = freq_ant & 0x03
-    rssi_high = (rssi_raw >> 7) & 1
+    rssi_high = (rssi_raw >> 7) & 1  # high bit of RSSI used for Ant ID only, not RSSI
     ant_no = ant_low + (4 if rssi_high else 0) + (8 if ant_group == 1 else 0) + 1
     freq_mhz = 865.0 + 0.5 * freq
     return freq_mhz, ant_no
@@ -87,8 +103,7 @@ def _rssi_display(rssi_raw: int) -> int:
 
 def parse_inv_tag_data(payload: bytes, read_phase: bool = False, ant_group: int = 0) -> Optional[TagRead]:
     """
-    Parse real-time inventory tag payload (cmd 0x89, 0x8A, 0x8B).
-    Format: [FreqAnt(1)][PC(2)][EPC(n)][Rssi(1)][Phase(2)?]
+    Parse real-time inventory tag (cmd 0x89, 0x8A, 0x8B) per spec: FreqAnt(1) PC(2) EPC(n) RSSI(1).
     Returns None if payload too short. Caller must assign timestamp immediately.
     """
     if len(payload) < 5:
@@ -119,6 +134,19 @@ def parse_inv_tag_data(payload: bytes, read_phase: bool = False, ant_group: int 
         phase=phase_hex,
         read_count=1,
     )
+
+
+def parse_fast_switch_completion(payload: bytes) -> Optional[Tuple[int, int]]:
+    """
+    Decode cmd_fast_switch_ant_inventory (0x8A) success response per YR8900 Communication
+    Interface Specification §2.2.9: TotalRead 3 bytes (high bits left), CommandDuration 4 bytes
+    (high bits left), in milliseconds. Returns (total_read, duration_ms) or None.
+    """
+    if len(payload) != 7:
+        return None
+    total_read = (payload[0] << 16) | (payload[1] << 8) | payload[2]
+    duration_ms = (payload[3] << 24) | (payload[4] << 16) | (payload[5] << 8) | payload[6]
+    return (total_read, duration_ms)
 
 
 def parse_buffer_tag_data(payload: bytes, ant_group: int = 0) -> Optional[TagRead]:
@@ -168,20 +196,25 @@ CMD_SET_FREQUENCY_REGION = 0x78
 
 
 class ReaderClient:
-    """TCP client for UHF reader. Push mode: start real-time inventory (0x89), receive tag frames."""
+    """TCP client for UHF reader. read_id is 1 byte (standard) or 12 bytes."""
 
-    def __init__(self, host: str, port: int, read_id: int = 0, ant_group: int = 0):
+    def __init__(self, host: str, port: int, read_id: bytes, ant_group: int = 0):
         self.host = host
         self.port = port
-        self.read_id = read_id
+        # Keep as 1 byte or 12 bytes (no padding)
+        self.read_id = read_id if len(read_id) in (1, READ_ID_LEN_12) else (read_id[:1] or bytes([0]))
+        self.read_id_len = len(self.read_id)
         self.ant_group = ant_group
+        self._last_error_code: Optional[int] = None  # last error byte from reader response
         self._sock: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._recv_buffer = bytearray()
         self._tag_callback: Optional[Callable[[TagRead], None]] = None
+        self._inventory_round_complete_callback: Optional[Callable[[], None]] = None
         self._response_queues: dict = {}  # cmd -> Queue for sync get responses
         self._response_lock = threading.Lock()
+        self._recv_lock = threading.Lock()  # guards socket.recv() so main thread can do sync recv
         self._connected = False
 
     def connect(self) -> bool:
@@ -189,6 +222,8 @@ class ReaderClient:
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self._sock.settimeout(5.0)
             self._sock.connect((self.host, self.port))
+            # Keep connection alive for long-running inventory (avoid firewall/router idle timeout)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             self._sock.settimeout(2.0)
             self._connected = True
             return True
@@ -219,9 +254,14 @@ class ReaderClient:
             self._connected = False
             return False
 
+    def _inv_read_id(self) -> bytes:
+        """Per UHF demo: inventory commands (0x89, 0x8A) use 1-byte reader address only."""
+        return self.read_id[0:1] if len(self.read_id) >= 12 else self.read_id
+
     def start_inventory_real(self, rounds: int = 0) -> bool:
-        """Start real-time inventory (0x89). rounds=0 typically means continuous. Uses current work antenna (single)."""
-        frame = build_frame(self.read_id, 0x89, bytes([rounds & 0xFF]))
+        """Start real-time (multitag) inventory (0x89). rounds=0 -> 0xFF for continuous until stopped (per protocol)."""
+        round_byte = 0xFF if rounds == 0 else (rounds & 0xFF)
+        frame = build_frame(self._inv_read_id(), 0x89, bytes([round_byte]))
         return self.send(frame)
 
     def start_fast_switch_inventory(
@@ -231,31 +271,52 @@ class ReaderClient:
         interval_ms: int = 0,
         repeat: int = 0,
     ) -> bool:
-        """Start fast switch antenna inventory (0x8A) for multi-antenna. antenna_indices: 1–8 (reader ports).
-        Payload format per demo: antenna bytes (index 0-based, first has stay, rest 0), then interval, repeat."""
+        """cmd_fast_switch_ant_inventory (0x8A) per spec §2.2.9: A Stay B Stay ... H Stay, Interval, Repeat."""
         if not antenna_indices or len(antenna_indices) > 8:
             return False
-        # Build antenna + stay bytes (antType1 style: first antenna has stay, others 0)
+        enabled = set(antenna_indices)
+        stay_val = max(1, stay_ms) & 0xFF
         payload = bytearray()
-        for i, ant in enumerate(antenna_indices):
-            payload.append((ant - 1) & 0xFF)  # 1-based -> 0-based
-            payload.append((stay_ms if i == 0 else 0) & 0xFF)
+        for i in range(8):
+            payload.append(i & 0xFF)  # ant index 00–07
+            payload.append(stay_val if (i + 1) in enabled else 0)
         payload.append(interval_ms & 0xFF)
-        payload.append(repeat & 0xFF)
-        frame = build_frame(self.read_id, 0x8A, bytes(payload))
+        payload.append((0xFF if repeat == 0 else repeat) & 0xFF)
+        frame = build_frame(self._inv_read_id(), 0x8A, bytes(payload))
         return self.send(frame)
 
     def set_tag_callback(self, cb: Callable[[TagRead], None]) -> None:
         self._tag_callback = cb
 
+    def set_inventory_round_complete_callback(self, cb: Optional[Callable[[], None]]) -> None:
+        """Set callback invoked when reader sends 0x8A completion (TotalRead + CommandDuration). Callback should re-send start inventory."""
+        self._inventory_round_complete_callback = cb
+
     def _receive_loop(self) -> None:
+        consecutive_errors = 0
+        max_consecutive_errors = 5  # only exit after several failures in a row
         while self._connected and self._sock and not self._stop.is_set():
             try:
-                chunk = self._sock.recv(4096)
+                with self._recv_lock:
+                    if not self._sock:
+                        break
+                    self._sock.settimeout(0.5)
+                    chunk = self._sock.recv(4096)
                 if not chunk:
+                    # Clean connection close
                     break
+                consecutive_errors = 0
                 self._recv_buffer.extend(chunk)
-                for read_id, cmd, payload in parse_frames(self._recv_buffer):
+                for read_id, cmd, payload in parse_frames(self._recv_buffer, self.read_id_len):
+                    # 0x8A success response (TotalRead 3B + CommandDuration 4B per spec §2.2.9): restart inventory
+                    if cmd == 0x8A and self._inventory_round_complete_callback:
+                        completion = parse_fast_switch_completion(payload)  # spec: 7-byte payload only
+                        if completion is not None:
+                            try:
+                                self._inventory_round_complete_callback()
+                            except Exception:
+                                pass
+                            continue
                     if cmd in (0x89, 0x8A, 0x8B):
                         tag = parse_inv_tag_data(payload, read_phase=False, ant_group=self.ant_group)
                         if tag and self._tag_callback:
@@ -267,83 +328,139 @@ class ReaderClient:
                     else:
                         with self._response_lock:
                             q = self._response_queues.pop(cmd, None)
+                            if q is None and (cmd & 0x80):
+                                q = self._response_queues.pop(cmd & 0x7F, None)
+                            if q is not None:
+                                self._response_queues.pop(cmd | 0x80 if not (cmd & 0x80) else cmd & 0x7F, None)
                         if q is not None:
                             try:
-                                err = payload[0] if len(payload) == 1 else None
-                                q.put_nowait((payload, err))
+                                # Reader success = 0x10 then data; error = single byte
+                                if len(payload) > 1 and payload[0] == 0x10:
+                                    actual_payload, err = payload[1:], None
+                                elif len(payload) == 1:
+                                    actual_payload, err = payload, payload[0]
+                                    self._last_error_code = payload[0]
+                                else:
+                                    actual_payload, err = payload, None
+                                q.put_nowait((actual_payload, err))
                             except Exception:
                                 pass
             except socket.timeout:
                 continue
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as e:
+                # Transient network errors: retry a few times before giving up
+                consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    break
+                time.sleep(min(0.5 * consecutive_errors, 2.0))
             except Exception:
-                break
+                consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    break
+                time.sleep(min(0.5 * consecutive_errors, 2.0))
         self._connected = False
 
-    def _send_and_wait(self, cmd: int, payload: bytes = b"", timeout: float = 2.0) -> Tuple[bytes, Optional[int]]:
-        """Send a get command and wait for response. Returns (payload_bytes, error_code or None)."""
-        q: Queue = Queue()
-        with self._response_lock:
-            self._response_queues[cmd] = q
-        frame = build_frame(self.read_id, cmd, payload)
-        if not self.send(frame):
-            with self._response_lock:
-                self._response_queues.pop(cmd, None)
-            return b"", 0xFF
-        try:
-            result = q.get(timeout=timeout)
-            return result
-        except Empty:
-            with self._response_lock:
-                self._response_queues.pop(cmd, None)
-            return b"", 0xFF
-        except Exception:
-            return b"", 0xFF
+    def _send_and_wait(self, cmd: int, payload: bytes = b"", timeout: float = 3.0) -> Tuple[bytes, Optional[int]]:
+        """Send a get command and wait for response. Hold recv lock before sending so receive thread cannot
+        read the response first; use 1-byte reader address like inventory."""
+        self._last_error_code = None
+        frame = build_frame(self._inv_read_id(), cmd, payload)
+        resp_cmd_alt = cmd | 0x80
+        deadline = time.monotonic() + timeout
+        with self._recv_lock:
+            if not self._sock:
+                return b"", 0xFF
+            if not self.send(frame):
+                return b"", 0xFF
+            self._sock.settimeout(0.25)
+            buf = bytearray(self._recv_buffer)
+            self._recv_buffer.clear()
+            while time.monotonic() < deadline:
+                try:
+                    chunk = self._sock.recv(4096)
+                except socket.timeout:
+                    continue
+                except Exception:
+                    return b"", 0xFF
+                if not chunk:
+                    return b"", 0xFF
+                buf.extend(chunk)
+                for read_id, c, pay in parse_frames(buf, 1):
+                    if c in (cmd, resp_cmd_alt):
+                        if len(pay) > 1 and pay[0] == 0x10:
+                            actual, err = pay[1:], None
+                        elif len(pay) == 1:
+                            actual, err = pay, pay[0]
+                            self._last_error_code = pay[0]
+                        else:
+                            actual, err = pay, None
+                        if buf:
+                            self._recv_buffer[:0] = buf
+                        return (actual, err)
+            if buf:
+                self._recv_buffer[:0] = buf
+            if self._sock:
+                self._sock.settimeout(2.0)
+        return b"", 0xFF
+
+    def get_last_error_code(self) -> Optional[int]:
+        """Last error byte from reader (e.g. 5); None if no error."""
+        return getattr(self, "_last_error_code", None)
 
     def get_firmware_version(self) -> Optional[Tuple[int, int]]:
-        """Returns (major, minor) or None."""
+        """Returns (major, minor) or None. Per Manuels: 2 bytes = major, minor; 1 byte = error."""
         payload, err = self._send_and_wait(CMD_GET_FIRMWARE)
-        if err is not None and err != 0:
-            return None
         if len(payload) >= 2:
             return (payload[0], payload[1])
+        if len(payload) == 1:
+            self._last_error_code = payload[0]
         return None
 
+    def get_firmware_version_raw(self) -> Tuple[bytes, Optional[int]]:
+        """Returns (raw_payload_bytes, error_code_or_None) for diagnostics/debug."""
+        return self._send_and_wait(CMD_GET_FIRMWARE)
+
     def get_reader_temperature(self) -> Optional[Tuple[int, int]]:
-        """Returns (sign_byte, value) for ± value °C, or None."""
+        """Returns (sign_byte, value) for ± value °C, or None. Per Manuels: 2 bytes = data; 1 = error."""
         payload, err = self._send_and_wait(CMD_GET_TEMPERATURE)
-        if err is not None and err != 0:
-            return None
         if len(payload) >= 2:
             return (payload[0], payload[1])
+        if len(payload) == 1:
+            self._last_error_code = payload[0]
         return None
 
     def get_work_antenna(self) -> Optional[int]:
+        """Per Manuels: 1-byte response 0x00–0x07 = work antenna index; other 1-byte = error."""
         payload, err = self._send_and_wait(CMD_GET_WORK_ANTENNA)
-        if err is not None and err != 0 or len(payload) < 1:
-            return None
-        return payload[0]
+        if len(payload) >= 1 and payload[0] in range(8):
+            return payload[0]
+        if len(payload) == 1:
+            self._last_error_code = payload[0]
+        return None
 
     def set_work_antenna(self, antenna: int) -> bool:
         frame = build_frame(self.read_id, CMD_SET_WORK_ANTENNA, bytes([antenna & 0xFF]))
         return self.send(frame)
 
     def get_output_power(self) -> Optional[bytes]:
-        """Returns 1 byte or 8 bytes (per antenna)."""
+        """Returns 1 byte or 8 bytes (per antenna). Per Manuels: 1/4/8 bytes = data."""
         payload, err = self._send_and_wait(CMD_GET_OUTPUT_POWER)
-        if err is not None and err != 0:
-            return None
-        return payload if payload else None
+        if len(payload) in (1, 4, 8):
+            return payload
+        return None
 
     def set_output_power(self, power_bytes: bytes) -> bool:
         frame = build_frame(self.read_id, CMD_SET_OUTPUT_POWER, power_bytes)
         return self.send(frame)
 
     def get_frequency_region(self) -> Optional[bytes]:
-        """Returns 3 bytes (region, start, end) or 6 for user-defined."""
+        """Returns 3 bytes (region, start, end) or 6 for user-defined. Per Manuels: 3/6 = data; 1 = error."""
         payload, err = self._send_and_wait(CMD_GET_FREQUENCY_REGION)
-        if err is not None and err != 0:
-            return None
-        return payload if payload else None
+        if len(payload) == 3 or len(payload) == 6:
+            return payload
+        if len(payload) == 1:
+            self._last_error_code = payload[0]
+        return None
 
     def set_frequency_region(self, region: int, start: int, end: int) -> bool:
         frame = build_frame(self.read_id, CMD_SET_FREQUENCY_REGION, bytes([region & 0xFF, start & 0xFF, end & 0xFF]))

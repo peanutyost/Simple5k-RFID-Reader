@@ -21,9 +21,12 @@ pip install -r requirements.txt
    - `api_key` — From Simple5K (generate at `tracker/generate-api-key/`)
    - `reader_host` — Reader IP
    - `reader_port` — Reader TCP port (e.g. 6000)
-   - `reader_id` — Reader address (default 0)
-   - `max_upload_queue_time_seconds` — Flush API batch after this long (e.g. 3)
-   - `api_dedupe_timeout_seconds` — Min lap interval; only earliest read per tag per window; dashboard uses same window (e.g. 10)
+   - `reader_id` — Reader ID as 24 hex chars (12 bytes); empty = 12 zero bytes
+   - `tag_idle_before_stage_seconds` — No new reads for this long → stage tag with best (strongest-RSSI) timestamp (e.g. 2)
+   - `max_staged_queue_time_seconds` — Flush all staged laps when the oldest has waited this long (e.g. 5)
+   - `max_staged_queue_size` — Flush all staged laps when queue reaches this many (e.g. 50)
+   - `max_upload_queue_time_seconds` — Internal; flush batch after this long (e.g. 3)
+   - `api_dedupe_timeout_seconds` — Min lap interval; same tag not sent again within this window; dashboard uses same window (e.g. 10)
 
 2. Or use the **Settings** page in the web UI after first run.
 
@@ -47,5 +50,5 @@ All timestamps use the **host system clock** (UTC): race start/stop and every ta
 
 ## API
 
-- **Record lap:** Batched and deduped: at most one lap per tag per `api_dedupe_timeout_seconds`, using the **earliest** read timestamp in that window.
+- **Record lap:** Tags are staged when they have had **no new reads** for `tag_idle_before_stage_seconds`; the timestamp sent is the **best** (strongest-RSSI) read in that period. Staged laps are sent when either the **oldest** staged item has waited `max_staged_queue_time_seconds` or the staged queue reaches `max_staged_queue_size` (then all are sent). Same tag is not sent again within `api_dedupe_timeout_seconds`.
 - **Start/Stop race:** Uses the same host clock for `update-race-time` timestamps.
