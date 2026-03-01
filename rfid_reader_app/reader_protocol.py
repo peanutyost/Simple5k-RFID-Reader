@@ -85,13 +85,20 @@ class TagRead:
     read_count: int = 1
 
 
+def _freq_index_to_mhz(freq_index: int) -> float:
+    """Convert 6-bit frequency parameter to MHz. Per region: 0–6 = ETSI 865–868.5; 7+ = FCC 902+."""
+    if freq_index < 7:
+        return 865.0 + 0.5 * freq_index
+    return 902.0 + 0.5 * (freq_index - 7)
+
+
 def _parse_freq_ant(freq_ant: int, rssi_raw: int, ant_group: int = 0) -> Tuple[float, int]:
-    """Per spec: FreqAnt high 6 bits = frequency, low 2 = ant; RSSI high bit => Ant 5/6/7/8 (else 1/2/3/4)."""
-    freq = (freq_ant >> 2) & 0x3F
+    """Per spec: FreqAnt high 6 bits = frequency index, low 2 = ant; RSSI high bit => Ant 5/6/7/8 (else 1/2/3/4)."""
+    freq_index = (freq_ant >> 2) & 0x3F
     ant_low = freq_ant & 0x03
     rssi_high = (rssi_raw >> 7) & 1  # high bit of RSSI used for Ant ID only, not RSSI
     ant_no = ant_low + (4 if rssi_high else 0) + (8 if ant_group == 1 else 0) + 1
-    freq_mhz = 865.0 + 0.5 * freq
+    freq_mhz = _freq_index_to_mhz(freq_index)
     return freq_mhz, ant_no
 
 
