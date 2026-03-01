@@ -1,0 +1,169 @@
+{% extends "base.html" %}
+{% block title %}RFID Reader — Dashboard{% endblock %}
+{% block head %}
+<script>
+function $(id) { return document.getElementById(id); }
+let statusInterval;
+function formatTime(iso) {
+  if (!iso) return '—';
+  try {
+    const d = new Date(iso);
+    return d.toISOString().replace('T',' ').slice(0, 23);
+  } catch(e) { return iso; }
+}
+function refreshStatus() {
+  fetch('/api/status')
+    .then(r => r.json())
+    .then(data => {
+      $('server_time_utc').textContent = data.server_time_utc || '—';
+      $('connected').textContent = data.connected ? 'Yes' : 'No';
+      $('connected').className = data.connected ? 'status-ok' : 'status-err';
+      $('reading').textContent = data.reading ? 'Yes' : 'No';
+      $('reading').className = data.reading ? 'status-ok' : '';
+      $('last_error').textContent = data.last_error || '—';
+      $('last_upload_error').textContent = data.last_upload_error || '—';
+      $('last_webhook_error').textContent = data.last_webhook_error || '—';
+      $('last_error').className = data.last_error ? 'status-err' : '';
+      $('last_upload_error').className = data.last_upload_error ? 'status-err' : '';
+      $('last_webhook_error').className = data.last_webhook_error ? 'status-err' : '';
+      const race = data.selected_race;
+      $('selected_race').textContent = race ? (race.name || 'Race #' + race.id) : '—';
+      const apiNote = $('api_configured_note');
+      if (apiNote) apiNote.style.display = data.api_configured !== false ? 'none' : 'block';
+      const tags = data.recent_tags || [];
+      const tbody = $('tag_table_body');
+      const formatDelta = (d) => d == null ? '—' : (d >= 0 ? '+' : '') + d.toFixed(3) + 's';
+      tbody.innerHTML = tags.map(t => `
+        <tr>
+          <td>${t.epc || '—'}</td>
+          <td>${formatTime(t.first_read_timestamp)}</td>
+          <td>${formatTime(t.strongest_rssi_timestamp)}</td>
+          <td>${formatDelta(t.delta_seconds)}</td>
+          <td>${t.strongest_rssi ?? '—'}</td>
+          <td>${t.read_count ?? '—'}</td>
+          <td>${t.rssi ?? '—'}</td>
+          <td>${t.antenna ?? '—'}</td>
+          <td>${t.frequency_mhz ?? '—'}</td>
+          <td>${t.pc || '—'}</td>
+          <td>${t.phase || '—'}</td>
+        </tr>
+      `).join('') || '<tr><td colspan="11">No recent tags (same window as API dedupe)</td></tr>';
+      const diag = data.reader_diagnostics || {};
+      $('diag_firmware').textContent = diag.firmware || '—';
+      $('diag_temperature').textContent = diag.temperature || '—';
+      $('diag_antenna').textContent = diag.work_antenna != null ? diag.work_antenna : '—';
+      $('diag_power').textContent = diag.output_power || '—';
+      $('diag_region').textContent = diag.frequency_region || '—';
+    })
+    .catch(() => {});
+}
+function connect() {
+  fetch('/api/connect', { method: 'POST' }).then(r => r.json()).then(() => refreshStatus());
+}
+function disconnect() {
+  fetch('/api/disconnect', { method: 'POST' }).then(r => r.json()).then(() => refreshStatus());
+}
+function startReading() {
+  fetch('/api/start-reading', { method: 'POST' }).then(r => r.json()).then(() => refreshStatus());
+}
+function stopReading() {
+  fetch('/api/stop-reading', { method: 'POST' }).then(r => r.json()).then(() => refreshStatus());
+}
+function startRace() {
+  fetch('/api/start-race', { method: 'POST' }).then(r => r.json()).then(() => refreshStatus());
+}
+function stopRace() {
+  fetch('/api/stop-race', { method: 'POST' }).then(r => r.json()).then(() => refreshStatus());
+}
+function refreshDiagnostics() {
+  fetch('/api/reader-get-diagnostics', { method: 'POST' }).then(r => r.json()).then(() => refreshStatus());
+}
+function loadRaces() {
+  fetch('/api/available-races').then(r => r.json()).then(data => {
+    const sel = $('race_select');
+    sel.innerHTML = '<option value="">— Select race —</option>' +
+      (data.races || []).map(r => `<option value="${r.id}" data-name="${(r.name||'').replace(/"/g,'&quot;')}">${r.name || 'Race #'+r.id} (${r.date || ''})</option>`).join('');
+  }).catch(() => {});
+}
+function selectRace() {
+  const sel = $('race_select');
+  const opt = sel.options[sel.selectedIndex];
+  if (!opt || !opt.value) return;
+  fetch('/api/select-race', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ race_id: parseInt(opt.value), name: opt.getAttribute('data-name') || opt.text })
+  }).then(() => refreshStatus());
+}
+document.addEventListener('DOMContentLoaded', function() {
+  refreshStatus();
+  loadRaces();
+  statusInterval = setInterval(refreshStatus, 1500);
+  $('race_select').addEventListener('change', selectRace);
+});
+</script>
+{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>Dashboard</h2>
+  <p id="api_configured_note" class="row" style="display:none; background:#f8f4e6; padding:0.4rem 0.6rem; border-radius:4px;">API not configured — set Base URL and API key in <a href="{{ url_for('settings') }}">Settings</a> to upload laps and use race start/stop.</p>
+  <p class="row"><span class="clock">System clock (UTC): <strong id="server_time_utc">—</strong></span></p>
+  <p class="row">
+    <span>Reader connected: <strong id="connected">—</strong></span>
+    <span style="margin-left:1rem">Reading: <strong id="reading">—</strong></span>
+    <span style="margin-left:1rem">Selected race: <strong id="selected_race">—</strong></span>
+  </p>
+  <p class="row">
+    <button onclick="connect()">Connect</button>
+    <button onclick="disconnect()">Disconnect</button>
+    <button onclick="startReading()">Start reading</button>
+    <button onclick="stopReading()">Stop reading</button>
+  </p>
+  <p class="row">
+    <label>Race: <select id="race_select"></select></label>
+    <button onclick="startRace()">Start Race</button>
+    <button onclick="stopRace()">Stop Race</button>
+  </p>
+  <p class="row">
+    <span>Last error: <span id="last_error">—</span></span>
+    <span style="margin-left:1rem">Upload: <span id="last_upload_error">—</span></span>
+    <span style="margin-left:1rem">Webhook: <span id="last_webhook_error">—</span></span>
+  </p>
+</div>
+
+<div class="card">
+  <h3>Reader diagnostics</h3>
+  <p class="row">
+    Firmware: <span id="diag_firmware">—</span>
+    Temperature: <span id="diag_temperature">—</span>
+    Work antenna: <span id="diag_antenna">—</span>
+    Output power: <span id="diag_power">—</span>
+    Freq region: <span id="diag_region">—</span>
+    <button onclick="refreshDiagnostics()">Refresh</button>
+  </p>
+</div>
+
+<div class="card">
+  <h3>Tags (one line per tag; API sends timestamp of strongest signal)</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>EPC</th>
+        <th>First seen (UTC)</th>
+        <th>Strongest (UTC)</th>
+        <th>Δ (s)</th>
+        <th>RSSI @ strongest</th>
+        <th>Read count</th>
+        <th>RSSI</th>
+        <th>Antenna</th>
+        <th>Freq (MHz)</th>
+        <th>PC</th>
+        <th>Phase</th>
+      </tr>
+    </thead>
+    <tbody id="tag_table_body">
+      <tr><td colspan="11">Loading…</td></tr>
+    </tbody>
+  </table>
+</div>
+{% endblock %}

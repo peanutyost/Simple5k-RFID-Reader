@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}RFID Reader{% endblock %}</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: system-ui, sans-serif; margin: 0; padding: 1rem; background: #1a1a2e; color: #eee; }
+        a { color: #6cb4ee; }
+        .card { background: #16213e; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+        .row { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; }
+        button, .btn { background: #0f3460; color: #eee; border: 1px solid #6cb4ee; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; text-decoration: none; display: inline-block; font-size: 1rem; }
+        button:hover, .btn:hover { background: #1a4a7a; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        input, select { padding: 0.4rem; border-radius: 4px; border: 1px solid #444; background: #0f3460; color: #eee; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 0.5rem; text-align: left; border-bottom: 1px solid #333; }
+        th { background: #0f3460; }
+        .status-ok { color: #6bcb6b; }
+        .status-err { color: #f87171; }
+        .clock { font-size: 1.2rem; font-family: monospace; }
+    </style>
+    {% block head %}{% endblock %}
+</head>
+<body>
+    <nav class="row">
+        <a href="{{ url_for('index') }}" class="btn">Dashboard</a>
+        <a href="{{ url_for('settings') }}" class="btn">Settings</a>
+    </nav>
+    {% block content %}{% endblock %}
+</body>
+</html>
