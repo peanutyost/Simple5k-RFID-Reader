@@ -204,6 +204,9 @@ cython_debug/
 # Manuals
 manuels/
 
+# App config (may contain secrets)
+config.json
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
