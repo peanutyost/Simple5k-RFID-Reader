@@ -23,6 +23,7 @@ app.config["SECRET_KEY"] = os.urandom(24).hex()
 # Config (load/save)
 # ---------------------------------------------------------------------------
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+STATE_PATH = Path(__file__).resolve().parent / "race_state.json"
 DEFAULT_CONFIG = {
     "api_base_url": "",
     "api_key": "",
@@ -57,6 +58,37 @@ def save_config(c: dict) -> None:
         json.dump(c, f, indent=2)
 
 
+def save_race_state() -> None:
+    """Persist race context and staged queue so they survive a crash or restart."""
+    with _state_lock:
+        state = {
+            "selected_race": selected_race,
+            "race_active": race_active,
+            "staged_queue": list(staged_queue),
+        }
+    try:
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
+
+def load_race_state() -> None:
+    """Restore race context and staged queue from the previous session."""
+    global selected_race, race_active, staged_queue
+    if not STATE_PATH.exists():
+        return
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        with _state_lock:
+            selected_race = state.get("selected_race") or None
+            race_active = bool(state.get("race_active", False))
+            staged_queue = list(state.get("staged_queue") or [])
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # State (thread-safe)
 # ---------------------------------------------------------------------------
@@ -66,6 +98,7 @@ reader_client: Optional[ReaderClient] = None
 connected = False
 reading = False
 selected_race: dict | None = None  # {id, name, ...}
+race_active: bool = False  # True only between Start Race and Stop Race; guards staging
 # Dashboard: one row per EPC (only fresh within api_dedupe_timeout)
 # Value: first_read_timestamp, strongest_rssi_timestamp, strongest_rssi, read_count, rssi (latest), antenna, ...
 dashboard_tags: dict[str, dict] = {}
@@ -247,7 +280,9 @@ def inventory_restart_worker() -> None:
 # Upload thread: stage tags when idle (no new reads), flush staged when max time or max size
 # ---------------------------------------------------------------------------
 def upload_worker() -> None:
-    global last_upload_error, last_sent_at, pending_api, staged_queue
+    global last_upload_error, last_sent_at, pending_api, staged_queue, race_active
+
+    _last_state_save: float = 0.0
 
     while True:
         time.sleep(0.2)
@@ -291,43 +326,56 @@ def upload_worker() -> None:
             except Empty:
                 pass
 
-            # Stage tags when: idle for tag_idle_seconds OR held for max_tag_pending_seconds (still being read)
-            # After staging, deleting from pending_api means a returning tag starts a fresh entry
-            for epc, data in list(pending_api.items()):
-                if data.get("race_id") is None:
-                    continue
-                if (now - last_sent_at.get(epc, 0)) < dedupe_timeout:
-                    continue
-                last_read = data.get("last_read_at") or 0
-                first_read = data.get("first_read_at") or last_read
-                idle_expired = (now - last_read) >= tag_idle_seconds
-                max_time_expired = (now - first_read) >= max_pending_seconds
-                if idle_expired or max_time_expired:
-                    staged_queue.append({
-                        "runner_rfid": epc,
-                        "race_id": data["race_id"],
-                        "timestamp": data["best_ts"],
-                        "staged_at": now,
-                    })
-                    del pending_api[epc]
+            # Stage tags when: race is active AND (idle for tag_idle_seconds OR held for max_tag_pending_seconds)
+            # Pre-race reads sit in pending_api unsent until Start Race is clicked (which clears them).
+            # After staging, deleting from pending_api means a returning tag starts a fresh entry.
+            if race_active:
+                for epc, data in list(pending_api.items()):
+                    if data.get("race_id") is None:
+                        continue
+                    if (now - last_sent_at.get(epc, 0)) < dedupe_timeout:
+                        continue
+                    last_read = data.get("last_read_at") or 0
+                    first_read = data.get("first_read_at") or last_read
+                    idle_expired = (now - last_read) >= tag_idle_seconds
+                    max_time_expired = (now - first_read) >= max_pending_seconds
+                    if idle_expired or max_time_expired:
+                        staged_queue.append({
+                            "runner_rfid": epc,
+                            "race_id": data["race_id"],
+                            "timestamp": data["best_ts"],
+                            "staged_at": now,
+                        })
+                        del pending_api[epc]
 
             # Flush staged queue when: oldest item has been staged for max_staged_queue_time_seconds, or queue size >= max_staged_queue_size
             oldest_staged = min((s["staged_at"] for s in staged_queue), default=now)
             should_flush = (now - oldest_staged) >= max_staged_time or len(staged_queue) >= max_staged_size
-            to_send = []
+            to_send_items = []
             if should_flush and staged_queue:
-                to_send = [
-                    {"runner_rfid": s["runner_rfid"], "race_id": s["race_id"], "timestamp": s["timestamp"]}
-                    for s in staged_queue
-                ]
-                for s in staged_queue:
-                    last_sent_at[s["runner_rfid"]] = now
+                to_send_items = list(staged_queue)
                 staged_queue = []
 
-        if to_send:
-            ok, err, _ = record_laps(api_url, api_key, to_send)
+        if to_send_items:
+            payload = [
+                {"runner_rfid": s["runner_rfid"], "race_id": s["race_id"], "timestamp": s["timestamp"]}
+                for s in to_send_items
+            ]
+            ok, err, _ = record_laps(api_url, api_key, payload)
             with _state_lock:
-                last_upload_error = None if ok else (err or "Unknown error")
+                if ok:
+                    for s in to_send_items:
+                        last_sent_at[s["runner_rfid"]] = now
+                    last_upload_error = None
+                else:
+                    # Re-queue at front so they retry on the next cycle; don't update last_sent_at
+                    staged_queue = to_send_items + staged_queue
+                    last_upload_error = err or "Unknown error"
+            save_race_state()  # persist immediately after any send attempt (success or re-queue)
+
+        elif race_active and (now - _last_state_save) >= 5.0:
+            save_race_state()  # periodic save so a crash loses at most 5 s of staging
+            _last_state_save = now
 
 
 # ---------------------------------------------------------------------------
@@ -663,6 +711,7 @@ def api_stop_reading():
 
 @app.route("/api/start-race", methods=["POST"])
 def api_start_race():
+    global race_active, pending_api
     if not selected_race:
         return jsonify({"error": "No race selected"}), 400
     cfg = load_config()
@@ -674,11 +723,17 @@ def api_start_race():
     ok, err = update_race_time(url, key, selected_race["id"], "start", ts)
     if not ok:
         return jsonify({"error": err or "Failed"}), 400
+    with _state_lock:
+        # Discard any reads that accumulated before the race started, then open the gate
+        pending_api.clear()
+        race_active = True
+    save_race_state()
     return jsonify({"status": "ok"})
 
 
 @app.route("/api/stop-race", methods=["POST"])
 def api_stop_race():
+    global race_active, pending_api, staged_queue, last_sent_at, last_upload_error
     if not selected_race:
         return jsonify({"error": "No race selected"}), 400
     cfg = load_config()
@@ -686,6 +741,47 @@ def api_stop_race():
     key = (cfg.get("api_key") or "").strip()
     if not url or not key:
         return jsonify({"error": "API not configured"}), 400
+    dedupe_timeout = float(cfg.get("api_dedupe_timeout_seconds", 10))
+    now = time.time()
+
+    # Close the gate immediately so upload_worker doesn't race with us
+    with _state_lock:
+        race_active = False
+        # Force-stage every pending tag that hasn't been sent recently
+        for epc, data in list(pending_api.items()):
+            if data.get("race_id") is None:
+                continue
+            if (now - last_sent_at.get(epc, 0)) < dedupe_timeout:
+                continue
+            staged_queue.append({
+                "runner_rfid": epc,
+                "race_id": data["race_id"],
+                "timestamp": data["best_ts"],
+                "staged_at": now,
+            })
+        pending_api.clear()
+        # Grab the full staged queue for immediate send
+        to_send_items = list(staged_queue)
+        staged_queue = []
+
+    # Flush everything to the API before recording stop time
+    if to_send_items and url and key:
+        payload = [
+            {"runner_rfid": s["runner_rfid"], "race_id": s["race_id"], "timestamp": s["timestamp"]}
+            for s in to_send_items
+        ]
+        send_ok, send_err, _ = record_laps(url, key, payload)
+        with _state_lock:
+            if send_ok:
+                for s in to_send_items:
+                    last_sent_at[s["runner_rfid"]] = now
+                last_upload_error = None
+            else:
+                # Re-queue so they aren't lost (upload_worker will retry)
+                staged_queue = to_send_items + staged_queue
+                last_upload_error = send_err or "Unknown error"
+
+    save_race_state()
     ts = _utc_now_iso()
     ok, err = update_race_time(url, key, selected_race["id"], "stop", ts)
     if not ok:
@@ -695,12 +791,15 @@ def api_stop_race():
 
 @app.route("/api/select-race", methods=["POST"])
 def api_select_race():
-    global selected_race
+    global selected_race, race_active, pending_api
     data = request.get_json() or {}
     race_id = data.get("race_id")
     if race_id is not None:
         with _state_lock:
             selected_race = {"id": race_id, "name": data.get("name", str(race_id))}
+            race_active = False   # require explicit Start Race for the new race
+            pending_api.clear()   # discard any reads from the previous race context
+    save_race_state()
     return jsonify({"status": "ok"})
 
 
@@ -783,15 +882,67 @@ def api_reader_diagnostics_debug():
 
 
 # ---------------------------------------------------------------------------
+# Auto-reconnect: if a race was active when the app last stopped, reconnect and resume
+# ---------------------------------------------------------------------------
+def auto_reconnect_worker() -> None:
+    global reader_client, connected, reading, reader_error, last_inventory_restart_at
+    with _state_lock:
+        should_reconnect = race_active
+    if not should_reconnect:
+        return
+    time.sleep(2.0)  # let Flask finish starting before touching the socket
+    cfg = load_config()
+    host = (cfg.get("reader_host") or "").strip()
+    port = int(cfg.get("reader_port") or 0) or 6000
+    if not host:
+        return
+    rid = _parse_reader_id(cfg.get("reader_id"))
+    client = ReaderClient(host, port, read_id=rid)
+    client.set_tag_callback(on_tag)
+    if not client.connect():
+        with _state_lock:
+            reader_error = "Auto-reconnect failed — connect manually"
+        return
+    client.start_receive_thread()
+    power = _parse_output_power(cfg.get("reader_output_power"))
+    if power is not None:
+        client.set_output_power(bytes([power]))
+    with _state_lock:
+        reader_client = client
+        connected = True
+        reader_error = None
+    antennas = _parse_antenna_list(cfg.get("reader_antennas") or "")
+    with _state_lock:
+        if len(antennas) >= 2:
+            stay = max(1, int(cfg.get("reader_fast_switch_stay_ms") or 1))
+            interval = int(cfg.get("reader_fast_switch_interval_ms") or 0)
+            repeat = int(cfg.get("reader_fast_switch_repeat") or 0)
+            ok = reader_client.start_fast_switch_inventory(antennas, stay_ms=stay, interval_ms=interval, repeat=repeat)
+        else:
+            work_ant = (antennas[0] - 1) if len(antennas) == 1 else 0
+            reader_client.set_work_antenna(work_ant & 0xFF)
+            ok = reader_client.start_inventory_real(0)
+        if ok:
+            reading = True
+            last_inventory_restart_at = time.time()
+            reader_client.set_inventory_round_complete_callback(_resend_start_inventory)
+        else:
+            reader_error = "Auto-reconnect: reader connected but failed to start inventory — start reading manually"
+
+
+# ---------------------------------------------------------------------------
 # Start background workers
 # ---------------------------------------------------------------------------
 def main():
+    load_race_state()  # restore selected race, race_active flag, and any unsent staged reads
     t0 = threading.Thread(target=inventory_restart_worker, daemon=True)
     t1 = threading.Thread(target=upload_worker, daemon=True)
     t2 = threading.Thread(target=webhook_worker, daemon=True)
+    t3 = threading.Thread(target=auto_reconnect_worker, daemon=True)
     t0.start()
     t1.start()
     t2.start()
+    t3.start()
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
 
 
