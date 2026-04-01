@@ -34,6 +34,7 @@ DEFAULT_CONFIG = {
     "max_upload_queue_time_seconds": 3,
     "api_dedupe_timeout_seconds": 10,
     "tag_idle_before_stage_seconds": 2,
+    "max_tag_pending_seconds": 30,  # force-stage a tag after this long even if still being read
     "max_staged_queue_time_seconds": 5,
     "max_staged_queue_size": 50,
     "reader_inventory_restart_minutes": 10,  # 0 = disabled; restart inventory periodically to keep running for hours
@@ -167,7 +168,6 @@ def on_tag(tag: TagRead) -> None:
     ts = _utc_now_iso()
     tag.timestamp = ts
     cfg = load_config()
-    timeout = float(cfg.get("api_dedupe_timeout_seconds", 10))
     with _state_lock:
         race_id = selected_race.get("id") if selected_race else None
     now_epoch = time.time()
@@ -202,17 +202,8 @@ def on_tag(tag: TagRead) -> None:
                 row["strongest_rssi"] = tag.rssi
                 row["strongest_rssi_timestamp"] = ts
 
-        # API pending: keep timestamp of read with strongest RSSI and last read time (for staging when idle)
-        if epc not in pending_api:
-            pending_api[epc] = {"best_ts": ts, "best_rssi": tag.rssi, "race_id": race_id, "last_read_at": now_epoch}
-        else:
-            if tag.rssi > pending_api[epc].get("best_rssi", -999):
-                pending_api[epc]["best_ts"] = ts
-                pending_api[epc]["best_rssi"] = tag.rssi
-            pending_api[epc]["race_id"] = race_id
-            pending_api[epc]["last_read_at"] = now_epoch
-
-        upload_queue.put({"epc": epc, "timestamp": ts, "rssi": tag.rssi, "race_id": race_id})
+        # Route tag reads through upload_queue only; upload_worker manages pending_api exclusively
+        upload_queue.put({"epc": epc, "timestamp": ts, "rssi": tag.rssi, "race_id": race_id, "read_at": now_epoch})
         if cfg.get("webhook_url"):
             webhook_queue.put({
                 "epc": epc, "timestamp": ts, "rssi": tag.rssi, "antenna": tag.antenna,
@@ -262,6 +253,7 @@ def upload_worker() -> None:
         time.sleep(0.2)
         cfg = load_config()
         tag_idle_seconds = float(cfg.get("tag_idle_before_stage_seconds", 2))
+        max_pending_seconds = float(cfg.get("max_tag_pending_seconds", 30))
         max_staged_time = float(cfg.get("max_staged_queue_time_seconds", 5))
         max_staged_size = int(cfg.get("max_staged_queue_size", 50))
         dedupe_timeout = float(cfg.get("api_dedupe_timeout_seconds", 10))
@@ -280,26 +272,37 @@ def upload_worker() -> None:
                     ts = r["timestamp"]
                     rssi = r.get("rssi", -999)
                     race_id = r.get("race_id")
-                    read_at = _iso_to_seconds(ts) or now
+                    read_at = r.get("read_at") or now
                     if epc not in pending_api:
-                        pending_api[epc] = {"best_ts": ts, "best_rssi": rssi, "race_id": race_id, "last_read_at": read_at}
+                        pending_api[epc] = {
+                            "best_ts": ts,
+                            "best_rssi": rssi,
+                            "race_id": race_id,
+                            "first_read_at": read_at,
+                            "last_read_at": read_at,
+                        }
                     else:
                         if rssi > pending_api[epc].get("best_rssi", -999):
                             pending_api[epc]["best_ts"] = ts
                             pending_api[epc]["best_rssi"] = rssi
                         pending_api[epc]["race_id"] = race_id
                         pending_api[epc]["last_read_at"] = read_at
+                        # first_read_at is never updated — it marks when this pass started
             except Empty:
                 pass
 
-            # Stage tags that have had no new reads for tag_idle_before_stage_seconds (use best_ts); skip if sent recently (dedupe)
+            # Stage tags when: idle for tag_idle_seconds OR held for max_tag_pending_seconds (still being read)
+            # After staging, deleting from pending_api means a returning tag starts a fresh entry
             for epc, data in list(pending_api.items()):
                 if data.get("race_id") is None:
                     continue
                 if (now - last_sent_at.get(epc, 0)) < dedupe_timeout:
                     continue
                 last_read = data.get("last_read_at") or 0
-                if (now - last_read) >= tag_idle_seconds:
+                first_read = data.get("first_read_at") or last_read
+                idle_expired = (now - last_read) >= tag_idle_seconds
+                max_time_expired = (now - first_read) >= max_pending_seconds
+                if idle_expired or max_time_expired:
                     staged_queue.append({
                         "runner_rfid": epc,
                         "race_id": data["race_id"],
@@ -465,6 +468,7 @@ def settings():
             "webhook_url": request.form.get("webhook_url", "").strip(),
             "webhook_secret_header": request.form.get("webhook_secret_header", "").strip(),
             "tag_idle_before_stage_seconds": max(0, int(request.form.get("tag_idle_before_stage_seconds") or 0) or 2),
+            "max_tag_pending_seconds": max(1, int(request.form.get("max_tag_pending_seconds") or 0) or 30),
             "max_staged_queue_time_seconds": max(1, int(request.form.get("max_staged_queue_time_seconds") or 0) or 5),
             "max_staged_queue_size": max(1, min(500, int(request.form.get("max_staged_queue_size") or 0) or 50)),
             "max_upload_queue_time_seconds": int(request.form.get("max_upload_queue_time_seconds") or 0) or 3,

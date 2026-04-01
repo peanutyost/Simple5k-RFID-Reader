@@ -62,6 +62,15 @@ function showError(msg) {
   const el = $('last_error');
   if (el) { el.textContent = msg || '—'; el.className = msg ? 'status-err' : ''; if (msg) lastErrorShownAt = Date.now(); }
 }
+var _successTimer = null;
+function showSuccess(msg) {
+  const el = $('race_success');
+  if (!el) return;
+  el.textContent = msg;
+  el.style.display = 'inline';
+  if (_successTimer) clearTimeout(_successTimer);
+  _successTimer = setTimeout(function() { el.style.display = 'none'; el.textContent = ''; }, 4000);
+}
 function connect() {
   fetch('/api/connect', { method: 'POST' })
     .then(async function(r) {
@@ -94,6 +103,7 @@ function startRace() {
     .then(async function(r) {
       const data = await r.json().catch(function() { return {}; });
       if (!r.ok) showError(data.error || ('Error ' + r.status));
+      else showSuccess('Race started successfully');
       refreshStatus();
     })
     .catch(function(err) { showError(err.message); refreshStatus(); });
@@ -103,6 +113,7 @@ function stopRace() {
     .then(async function(r) {
       const data = await r.json().catch(function() { return {}; });
       if (!r.ok) showError(data.error || ('Error ' + r.status));
+      else showSuccess('Race stopped successfully');
       refreshStatus();
     })
     .catch(function(err) { showError(err.message); refreshStatus(); });
@@ -150,6 +161,7 @@ document.addEventListener('DOMContentLoaded', function() {
     <span>Last error: <span id="last_error">—</span></span>
     <span>Upload: <span id="last_upload_error">—</span></span>
     <span>Webhook: <span id="last_webhook_error">—</span></span>
+    <span id="race_success" style="display:none;color:#2a7;font-weight:bold;"></span>
   </p>
 </div>
 

@@ -55,6 +55,7 @@ function refreshDiagnostics() {
 
     <h3>Upload &amp; staging</h3>
     <p><label>Tag idle before stage (seconds): <input type="number" name="tag_idle_before_stage_seconds" value="{{ config.get('tag_idle_before_stage_seconds', 2) }}" min="0" max="60"> (no new reads for this long → stage tag with best timestamp)</label></p>
+    <p><label>Max tag pending time (seconds): <input type="number" name="max_tag_pending_seconds" value="{{ config.get('max_tag_pending_seconds', 30) }}" min="1" max="300"> (force-send strongest read after this long even if tag is still in range; tag re-entry restarts tracking)</label></p>
     <p><label>Max staged queue time (seconds): <input type="number" name="max_staged_queue_time_seconds" value="{{ config.get('max_staged_queue_time_seconds', 5) }}" min="1" max="120"> (flush all staged when oldest has waited this long)</label></p>
     <p><label>Max staged queue size: <input type="number" name="max_staged_queue_size" value="{{ config.get('max_staged_queue_size', 50) }}" min="1" max="500"> (flush all staged when queue reaches this many)</label></p>
     <p><label>Max queue time (seconds): <input type="number" name="max_upload_queue_time_seconds" value="{{ config.get('max_upload_queue_time_seconds', 3) }}" min="1" max="60"> (internal; flush batch to API after this long)</label></p>
