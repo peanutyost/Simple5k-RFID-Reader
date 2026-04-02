@@ -372,6 +372,7 @@ def upload_worker() -> None:
                     staged_queue = to_send_items + staged_queue
                     last_upload_error = err or "Unknown error"
             save_race_state()  # persist immediately after any send attempt (success or re-queue)
+            _last_state_save = now
 
         elif race_active and (now - _last_state_save) >= 5.0:
             save_race_state()  # periodic save so a crash loses at most 5 s of staging
@@ -727,6 +728,13 @@ def api_start_race():
         # Discard any reads that accumulated before the race started, then open the gate
         pending_api.clear()
         race_active = True
+    # Drain and discard whatever is in the upload queue — these are all pre-race reads.
+    # Must happen outside the lock since queue.get_nowait() doesn't need it.
+    try:
+        while True:
+            upload_queue.get_nowait()
+    except Empty:
+        pass
     save_race_state()
     return jsonify({"status": "ok"})
 
