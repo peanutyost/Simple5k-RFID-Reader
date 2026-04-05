@@ -32,7 +32,6 @@ DEFAULT_CONFIG = {
     "reader_id": "",  # 24 hex chars (12 bytes); empty = 12 zero bytes
     "webhook_url": "",
     "webhook_secret_header": "",
-    "max_upload_queue_time_seconds": 3,
     "api_dedupe_timeout_seconds": 10,
     "tag_idle_before_stage_seconds": 2,
     "max_tag_pending_seconds": 30,  # force-stage a tag after this long even if still being read
@@ -200,12 +199,11 @@ def _delta_first_to_strongest(first_iso: str, strongest_iso: str) -> Optional[fl
 def on_tag(tag: TagRead) -> None:
     ts = _utc_now_iso()
     tag.timestamp = ts
-    cfg = load_config()
-    with _state_lock:
-        race_id = selected_race.get("id") if selected_race else None
     now_epoch = time.time()
 
     with _state_lock:
+        race_id = selected_race.get("id") if selected_race else None
+
         # Dashboard: one line per EPC; first read time; strongest signal time + RSSI; increment read count
         epc = tag.epc
         if epc not in dashboard_tags:
@@ -237,11 +235,11 @@ def on_tag(tag: TagRead) -> None:
 
         # Route tag reads through upload_queue only; upload_worker manages pending_api exclusively
         upload_queue.put({"epc": epc, "timestamp": ts, "rssi": tag.rssi, "race_id": race_id, "read_at": now_epoch})
-        if cfg.get("webhook_url"):
-            webhook_queue.put({
-                "epc": epc, "timestamp": ts, "rssi": tag.rssi, "antenna": tag.antenna,
-                "race_id": race_id,
-            })
+        # Always queue for webhook; webhook_worker discards if URL not configured
+        webhook_queue.put({
+            "epc": epc, "timestamp": ts, "rssi": tag.rssi, "antenna": tag.antenna,
+            "race_id": race_id,
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -294,15 +292,15 @@ def upload_worker() -> None:
         dedupe_timeout = float(cfg.get("api_dedupe_timeout_seconds", 10))
         api_url = (cfg.get("api_base_url") or "").strip()
         api_key = (cfg.get("api_key") or "").strip()
-        if not api_url or not api_key:
-            continue
 
         now = time.time()
         with _state_lock:
-            # Drain upload queue into pending_api (strongest RSSI wins; update last_read_at from latest read)
+            # Always drain upload queue so it doesn't grow unboundedly when API is not configured
             try:
                 while True:
                     r = upload_queue.get_nowait()
+                    if not api_url or not api_key or not race_active:
+                        continue  # discard when API not configured or race not running
                     epc = r["epc"]
                     ts = r["timestamp"]
                     rssi = r.get("rssi", -999)
@@ -326,6 +324,10 @@ def upload_worker() -> None:
             except Empty:
                 pass
 
+        if not api_url or not api_key:
+            continue
+
+        with _state_lock:
             # Stage tags when: race is active AND (idle for tag_idle_seconds OR held for max_tag_pending_seconds)
             # Pre-race reads sit in pending_api unsent until Start Race is clicked (which clears them).
             # After staging, deleting from pending_api means a returning tag starts a fresh entry.
@@ -389,8 +391,10 @@ def webhook_worker() -> None:
         cfg = load_config()
         url = (cfg.get("webhook_url") or "").strip()
         if not url:
+            # Drain the entire queue so it doesn't grow unboundedly
             try:
-                webhook_queue.get_nowait()
+                while True:
+                    webhook_queue.get_nowait()
             except Empty:
                 pass
             continue
@@ -520,7 +524,6 @@ def settings():
             "max_tag_pending_seconds": max(1, int(request.form.get("max_tag_pending_seconds") or 0) or 30),
             "max_staged_queue_time_seconds": max(1, int(request.form.get("max_staged_queue_time_seconds") or 0) or 5),
             "max_staged_queue_size": max(1, min(500, int(request.form.get("max_staged_queue_size") or 0) or 50)),
-            "max_upload_queue_time_seconds": int(request.form.get("max_upload_queue_time_seconds") or 0) or 3,
             "api_dedupe_timeout_seconds": int(request.form.get("api_dedupe_timeout_seconds") or 0) or 10,
         }
         save_config(config)
@@ -546,9 +549,19 @@ def api_status():
             reader_error = reader_error or "Connection lost"
     prune_dashboard()
     cfg = load_config()
+    with _state_lock:
+        tags_snapshot = [dict(row) for row in dashboard_tags.values()]
+        status = {
+            "connected": connected,
+            "reading": reading,
+            "selected_race": selected_race,
+            "race_active": race_active,
+            "last_error": reader_error,
+            "last_upload_error": last_upload_error,
+            "last_webhook_error": last_webhook_error,
+        }
     tags_list = []
-    for row in dashboard_tags.values():
-        r = dict(row)
+    for r in tags_snapshot:
         delta = _delta_first_to_strongest(
             r.get("first_read_timestamp"),
             r.get("strongest_rssi_timestamp"),
@@ -556,17 +569,10 @@ def api_status():
         r["delta_seconds"] = delta  # + = strongest after first seen
         tags_list.append(r)
     api_configured = bool((cfg.get("api_base_url") or "").strip() and (cfg.get("api_key") or "").strip())
-    return jsonify({
-        "connected": connected,
-        "reading": reading,
-        "selected_race": selected_race,
-        "recent_tags": tags_list,
-        "last_error": reader_error,
-        "last_upload_error": last_upload_error,
-        "last_webhook_error": last_webhook_error,
-        "server_time_utc": _utc_now_iso(),
-        "api_configured": api_configured,
-    })
+    status["recent_tags"] = tags_list
+    status["server_time_utc"] = _utc_now_iso()
+    status["api_configured"] = api_configured
+    return jsonify(status)
 
 
 @app.route("/api/available-races")
@@ -807,7 +813,7 @@ def api_select_race():
             selected_race = {"id": race_id, "name": data.get("name", str(race_id))}
             race_active = False   # require explicit Start Race for the new race
             pending_api.clear()   # discard any reads from the previous race context
-    save_race_state()
+        save_race_state()
     return jsonify({"status": "ok"})
 
 
