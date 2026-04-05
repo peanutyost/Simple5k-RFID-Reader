@@ -56,12 +56,22 @@ def save_config(c: dict) -> None:
 
 
 def save_race_state() -> None:
-    """Persist race context and staged queue so they survive a crash or restart."""
+    """Persist race context, pending reads, and staged queue so they survive a crash or restart."""
     with _state_lock:
+        # Convert pending_api to staged entries so no tag is lost on crash
+        pending_as_staged = []
+        for epc, data in pending_api.items():
+            if data.get("race_id") is not None:
+                pending_as_staged.append({
+                    "runner_rfid": epc,
+                    "race_id": data["race_id"],
+                    "timestamp": data["best_ts"],
+                    "staged_at": time.time(),
+                })
         state = {
             "selected_race": selected_race,
             "race_active": race_active,
-            "staged_queue": list(staged_queue),
+            "staged_queue": pending_as_staged + list(staged_queue),
         }
     try:
         with open(STATE_PATH, "w", encoding="utf-8") as f:
@@ -279,94 +289,103 @@ def upload_worker() -> None:
 
     _last_state_save: float = 0.0
     _retry_after: float = 0.0  # don't attempt a send until this time (backoff after failure)
+    _backoff: float = 2.0  # current backoff delay; doubles on each failure, resets on success
 
     while True:
-        time.sleep(0.2)
-        cfg = load_config()
-        max_pending_seconds = float(cfg.get("max_tag_pending_seconds", 30))
-        max_staged_time = float(cfg.get("max_staged_queue_time_seconds", 5))
-        max_staged_size = int(cfg.get("max_staged_queue_size", 50))
-        api_url = (cfg.get("api_base_url") or "").strip()
-        api_key = (cfg.get("api_key") or "").strip()
+        try:
+            time.sleep(0.2)
+            cfg = load_config()
+            max_pending_seconds = float(cfg.get("max_tag_pending_seconds", 30))
+            max_staged_time = float(cfg.get("max_staged_queue_time_seconds", 5))
+            max_staged_size = int(cfg.get("max_staged_queue_size", 50))
+            api_url = (cfg.get("api_base_url") or "").strip()
+            api_key = (cfg.get("api_key") or "").strip()
 
-        now = time.time()
-        with _state_lock:
-            # Always drain upload queue so it doesn't grow unboundedly
-            try:
-                while True:
-                    r = upload_queue.get_nowait()
-                    if not api_url or not api_key or not race_active:
-                        continue  # discard when API not configured or race not running
-                    epc = r["epc"]
-                    ts = r["timestamp"]
-                    rssi = r.get("rssi", -999)
-                    race_id = r.get("race_id")
-                    read_at = r.get("read_at") or now
-                    if epc not in pending_api:
-                        pending_api[epc] = {
-                            "best_ts": ts,
-                            "best_rssi": rssi,
-                            "race_id": race_id,
-                            "first_read_at": read_at,
-                        }
-                    else:
-                        if rssi > pending_api[epc].get("best_rssi", -999):
-                            pending_api[epc]["best_ts"] = ts
-                            pending_api[epc]["best_rssi"] = rssi
-                        pending_api[epc]["race_id"] = race_id
-                        # first_read_at is never updated — it marks when this pass started
-            except Empty:
-                pass
-
-        if not api_url or not api_key:
-            continue
-
-        with _state_lock:
-            # Stage tags after max_tag_pending_seconds from first read — pick strongest signal, add to staged queue.
-            # Once staged, the tag is removed from pending_api so new reads start a fresh read window.
-            if race_active:
-                for epc, data in list(pending_api.items()):
-                    if data.get("race_id") is None:
-                        continue
-                    first_read = data.get("first_read_at") or 0
-                    if (now - first_read) >= max_pending_seconds:
-                        staged_queue.append({
-                            "runner_rfid": epc,
-                            "race_id": data["race_id"],
-                            "timestamp": data["best_ts"],
-                            "staged_at": now,
-                        })
-                        del pending_api[epc]
-
-            # Flush staged queue when: oldest item has been staged for max_staged_queue_time_seconds, or queue size >= max_staged_queue_size
-            # Skip flush if still in backoff window after a previous failure
-            oldest_staged = min((s["staged_at"] for s in staged_queue), default=now)
-            should_flush = (now - oldest_staged) >= max_staged_time or len(staged_queue) >= max_staged_size
-            to_send_items = []
-            if should_flush and staged_queue and now >= _retry_after:
-                to_send_items = list(staged_queue)
-                staged_queue = []
-
-        if to_send_items:
-            payload = [
-                {"runner_rfid": s["runner_rfid"], "race_id": s["race_id"], "timestamp": s["timestamp"]}
-                for s in to_send_items
-            ]
-            ok, err, _ = record_laps(api_url, api_key, payload)
+            now = time.time()
             with _state_lock:
-                if ok:
-                    last_upload_error = None
-                    _retry_after = 0.0
-                else:
-                    staged_queue = to_send_items + staged_queue
-                    last_upload_error = err or "Unknown error"
-                    _retry_after = now + 5.0  # wait 5 s before retrying
-            save_race_state()  # persist immediately after any send attempt (success or re-queue)
-            _last_state_save = now
+                # Always drain upload queue so it doesn't grow unboundedly
+                try:
+                    while True:
+                        r = upload_queue.get_nowait()
+                        if not api_url or not api_key or not race_active:
+                            continue  # discard when API not configured or race not running
+                        epc = r["epc"]
+                        ts = r["timestamp"]
+                        rssi = r.get("rssi", -999)
+                        race_id = r.get("race_id")
+                        read_at = r.get("read_at") or now
+                        if epc not in pending_api:
+                            pending_api[epc] = {
+                                "best_ts": ts,
+                                "best_rssi": rssi,
+                                "race_id": race_id,
+                                "first_read_at": read_at,
+                            }
+                        else:
+                            if rssi > pending_api[epc].get("best_rssi", -999):
+                                pending_api[epc]["best_ts"] = ts
+                                pending_api[epc]["best_rssi"] = rssi
+                            pending_api[epc]["race_id"] = race_id
+                            # first_read_at is never updated — it marks when this pass started
+                except Empty:
+                    pass
 
-        elif race_active and (now - _last_state_save) >= 5.0:
-            save_race_state()  # periodic save so a crash loses at most 5 s of staging
-            _last_state_save = now
+            if not api_url or not api_key:
+                continue
+
+            with _state_lock:
+                # Stage tags after max_tag_pending_seconds from first read — pick strongest signal, add to staged queue.
+                # Once staged, the tag is removed from pending_api so new reads start a fresh read window.
+                if race_active:
+                    for epc, data in list(pending_api.items()):
+                        if data.get("race_id") is None:
+                            continue
+                        first_read = data.get("first_read_at") or 0
+                        if (now - first_read) >= max_pending_seconds:
+                            staged_queue.append({
+                                "runner_rfid": epc,
+                                "race_id": data["race_id"],
+                                "timestamp": data["best_ts"],
+                                "staged_at": now,
+                            })
+                            del pending_api[epc]
+
+                # Flush staged queue when: oldest item has been staged for max_staged_queue_time_seconds, or queue size >= max_staged_queue_size
+                # Skip flush if still in backoff window after a previous failure
+                oldest_staged = min((s["staged_at"] for s in staged_queue), default=now)
+                should_flush = (now - oldest_staged) >= max_staged_time or len(staged_queue) >= max_staged_size
+                to_send_items = []
+                if should_flush and staged_queue and now >= _retry_after:
+                    to_send_items = list(staged_queue)
+                    staged_queue = []
+
+            if to_send_items:
+                payload = [
+                    {"runner_rfid": s["runner_rfid"], "race_id": s["race_id"], "timestamp": s["timestamp"]}
+                    for s in to_send_items
+                ]
+                try:
+                    ok, err, _ = record_laps(api_url, api_key, payload)
+                except Exception as e:
+                    ok, err = False, f"Unexpected: {e}"
+                with _state_lock:
+                    if ok:
+                        last_upload_error = None
+                        _retry_after = 0.0
+                        _backoff = 2.0
+                    else:
+                        staged_queue = to_send_items + staged_queue
+                        last_upload_error = err or "Unknown error"
+                        _retry_after = now + _backoff
+                        _backoff = min(_backoff * 2, 60.0)  # cap at 60s
+                save_race_state()  # persist immediately after any send attempt (success or re-queue)
+                _last_state_save = now
+
+            elif race_active and (now - _last_state_save) >= 5.0:
+                save_race_state()  # periodic save so a crash loses at most 5 s of staging
+                _last_state_save = now
+        except Exception:
+            pass  # never let the upload thread die — tags would be lost
 
 
 # ---------------------------------------------------------------------------
