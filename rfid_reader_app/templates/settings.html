@@ -54,11 +54,10 @@ function refreshDiagnostics() {
     <p><label>Webhook secret header: <input type="text" name="webhook_secret_header" value="{{ config.get('webhook_secret_header','') }}" size="20" placeholder="Optional"></label></p>
 
     <h3>Upload &amp; staging</h3>
-    <p><label>Tag idle before stage (seconds): <input type="number" name="tag_idle_before_stage_seconds" value="{{ config.get('tag_idle_before_stage_seconds', 2) }}" min="0" max="60"> (no new reads for this long → stage tag with best timestamp)</label></p>
-    <p><label>Max tag pending time (seconds): <input type="number" name="max_tag_pending_seconds" value="{{ config.get('max_tag_pending_seconds', 30) }}" min="1" max="300"> (force-send strongest read after this long even if tag is still in range; tag re-entry restarts tracking)</label></p>
+    <p><label>Tag read window (seconds): <input type="number" name="max_tag_pending_seconds" value="{{ config.get('max_tag_pending_seconds', 30) }}" min="1" max="300"> (wait this long from first read to pick strongest signal, then stage for upload)</label></p>
     <p><label>Max staged queue time (seconds): <input type="number" name="max_staged_queue_time_seconds" value="{{ config.get('max_staged_queue_time_seconds', 5) }}" min="1" max="120"> (flush all staged when oldest has waited this long)</label></p>
     <p><label>Max staged queue size: <input type="number" name="max_staged_queue_size" value="{{ config.get('max_staged_queue_size', 50) }}" min="1" max="500"> (flush all staged when queue reaches this many)</label></p>
-    <p><label>API dedupe timeout (seconds): <input type="number" name="api_dedupe_timeout_seconds" value="{{ config.get('api_dedupe_timeout_seconds', 10) }}" min="1" max="120"> (min lap interval; same tag not sent again within this window; dashboard uses same window)</label></p>
+    <p><label>Tag cooldown after staging (seconds): <input type="number" name="api_dedupe_timeout_seconds" value="{{ config.get('api_dedupe_timeout_seconds', 10) }}" min="1" max="120"> (after a tag is staged, drop all reads for it during this window; also controls dashboard clear time)</label></p>
 
     <p><button type="submit">Save</button></p>
   </form>
