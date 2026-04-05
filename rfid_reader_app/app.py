@@ -280,6 +280,7 @@ def upload_worker() -> None:
     global last_upload_error, last_sent_at, pending_api, staged_queue, race_active
 
     _last_state_save: float = 0.0
+    _retry_after: float = 0.0  # don't attempt a send until this time (backoff after failure)
 
     while True:
         time.sleep(0.2)
@@ -300,13 +301,15 @@ def upload_worker() -> None:
                     if not api_url or not api_key or not race_active:
                         continue  # discard when API not configured or race not running
                     epc = r["epc"]
-                    # Cooldown: drop reads entirely for a tag that was recently staged+sent
-                    if (now - last_sent_at.get(epc, 0)) < dedupe_timeout:
-                        continue
                     ts = r["timestamp"]
                     rssi = r.get("rssi", -999)
                     race_id = r.get("race_id")
                     read_at = r.get("read_at") or now
+                    # Cooldown: drop reads whose timestamp is within dedupe_timeout of the last staged crossing's
+                    # best_ts (the same value sent to the API). API downtime has no effect on this comparison.
+                    read_ts = _iso_to_seconds(ts) or read_at
+                    if (read_ts - last_sent_at.get(epc, 0)) < dedupe_timeout:
+                        continue
                     if epc not in pending_api:
                         pending_api[epc] = {
                             "best_ts": ts,
@@ -341,13 +344,17 @@ def upload_worker() -> None:
                             "timestamp": data["best_ts"],
                             "staged_at": now,
                         })
+                        # Record the read timestamp of this crossing so new reads are compared
+                        # against when the runner actually crossed, not when the API sent it
+                        last_sent_at[epc] = _iso_to_seconds(data["best_ts"]) or now
                         del pending_api[epc]
 
             # Flush staged queue when: oldest item has been staged for max_staged_queue_time_seconds, or queue size >= max_staged_queue_size
+            # Skip flush if still in backoff window after a previous failure
             oldest_staged = min((s["staged_at"] for s in staged_queue), default=now)
             should_flush = (now - oldest_staged) >= max_staged_time or len(staged_queue) >= max_staged_size
             to_send_items = []
-            if should_flush and staged_queue:
+            if should_flush and staged_queue and now >= _retry_after:
                 to_send_items = list(staged_queue)
                 staged_queue = []
 
@@ -359,13 +366,12 @@ def upload_worker() -> None:
             ok, err, _ = record_laps(api_url, api_key, payload)
             with _state_lock:
                 if ok:
-                    for s in to_send_items:
-                        last_sent_at[s["runner_rfid"]] = now
                     last_upload_error = None
+                    _retry_after = 0.0
                 else:
-                    # Re-queue at front so they retry on the next cycle; don't update last_sent_at
                     staged_queue = to_send_items + staged_queue
                     last_upload_error = err or "Unknown error"
+                    _retry_after = now + 5.0  # wait 5 s before retrying
             save_race_state()  # persist immediately after any send attempt (success or re-queue)
             _last_state_save = now
 
