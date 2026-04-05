@@ -32,7 +32,6 @@ DEFAULT_CONFIG = {
     "reader_id": "",  # 24 hex chars (12 bytes); empty = 12 zero bytes
     "webhook_url": "",
     "webhook_secret_header": "",
-    "api_dedupe_timeout_seconds": 10,
     "max_tag_pending_seconds": 30,  # wait this long from first read to pick strongest signal, then stage
     "max_staged_queue_time_seconds": 5,
     "max_staged_queue_size": 50,
@@ -97,14 +96,13 @@ connected = False
 reading = False
 selected_race: dict | None = None  # {id, name, ...}
 race_active: bool = False  # True only between Start Race and Stop Race; guards staging
-# Dashboard: one row per EPC (only fresh within api_dedupe_timeout)
+# Dashboard: one row per EPC (pruned after api_dedupe_timeout_seconds of no reads)
 # Value: first_read_timestamp, strongest_rssi_timestamp, strongest_rssi, read_count, rssi (latest), antenna, ...
 dashboard_tags: dict[str, dict] = {}
 # API: pending_api[epc] = { best_ts, best_rssi, race_id, last_read_at (epoch) }; when tag has no new reads for tag_idle_before_stage_seconds, move to staged_queue
 pending_api: dict[str, dict] = {}
 # staged_queue: list of { runner_rfid, race_id, timestamp (best_ts), staged_at (epoch) }; flush when max time or max size
 staged_queue: list[dict] = []
-last_sent_at: dict[str, float] = {}
 upload_queue: Queue = Queue()
 webhook_queue: Queue = Queue()
 last_upload_error: str | None = None
@@ -277,7 +275,7 @@ def inventory_restart_worker() -> None:
 # Upload thread: stage tags when idle (no new reads), flush staged when max time or max size
 # ---------------------------------------------------------------------------
 def upload_worker() -> None:
-    global last_upload_error, last_sent_at, pending_api, staged_queue, race_active
+    global last_upload_error, pending_api, staged_queue, race_active
 
     _last_state_save: float = 0.0
     _retry_after: float = 0.0  # don't attempt a send until this time (backoff after failure)
@@ -288,7 +286,6 @@ def upload_worker() -> None:
         max_pending_seconds = float(cfg.get("max_tag_pending_seconds", 30))
         max_staged_time = float(cfg.get("max_staged_queue_time_seconds", 5))
         max_staged_size = int(cfg.get("max_staged_queue_size", 50))
-        dedupe_timeout = float(cfg.get("api_dedupe_timeout_seconds", 10))
         api_url = (cfg.get("api_base_url") or "").strip()
         api_key = (cfg.get("api_key") or "").strip()
 
@@ -305,11 +302,6 @@ def upload_worker() -> None:
                     rssi = r.get("rssi", -999)
                     race_id = r.get("race_id")
                     read_at = r.get("read_at") or now
-                    # Cooldown: drop reads whose timestamp is within dedupe_timeout of the last staged crossing's
-                    # best_ts (the same value sent to the API). API downtime has no effect on this comparison.
-                    read_ts = _iso_to_seconds(ts) or read_at
-                    if (read_ts - last_sent_at.get(epc, 0)) < dedupe_timeout:
-                        continue
                     if epc not in pending_api:
                         pending_api[epc] = {
                             "best_ts": ts,
@@ -330,8 +322,8 @@ def upload_worker() -> None:
             continue
 
         with _state_lock:
-            # Stage tags after max_tag_pending_seconds from first read — pick strongest signal, add to upload queue.
-            # Reads during cooldown were already dropped in the drain, so no dedupe check needed here.
+            # Stage tags after max_tag_pending_seconds from first read — pick strongest signal, add to staged queue.
+            # Once staged, the tag is removed from pending_api so new reads start a fresh read window.
             if race_active:
                 for epc, data in list(pending_api.items()):
                     if data.get("race_id") is None:
@@ -344,9 +336,6 @@ def upload_worker() -> None:
                             "timestamp": data["best_ts"],
                             "staged_at": now,
                         })
-                        # Record the read timestamp of this crossing so new reads are compared
-                        # against when the runner actually crossed, not when the API sent it
-                        last_sent_at[epc] = _iso_to_seconds(data["best_ts"]) or now
                         del pending_api[epc]
 
             # Flush staged queue when: oldest item has been staged for max_staged_queue_time_seconds, or queue size >= max_staged_queue_size
@@ -414,7 +403,7 @@ def webhook_worker() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Prune dashboard to same window as API dedupe
+# Prune stale dashboard rows (no reads for api_dedupe_timeout_seconds)
 # ---------------------------------------------------------------------------
 def prune_dashboard() -> None:
     cfg = load_config()
@@ -745,7 +734,7 @@ def api_start_race():
 
 @app.route("/api/stop-race", methods=["POST"])
 def api_stop_race():
-    global race_active, pending_api, staged_queue, last_sent_at, last_upload_error
+    global race_active, pending_api, staged_queue, last_upload_error
     if not selected_race:
         return jsonify({"error": "No race selected"}), 400
     cfg = load_config()
@@ -753,17 +742,14 @@ def api_stop_race():
     key = (cfg.get("api_key") or "").strip()
     if not url or not key:
         return jsonify({"error": "API not configured"}), 400
-    dedupe_timeout = float(cfg.get("api_dedupe_timeout_seconds", 10))
     now = time.time()
 
     # Close the gate immediately so upload_worker doesn't race with us
     with _state_lock:
         race_active = False
-        # Force-stage every pending tag that hasn't been sent recently
+        # Force-stage every pending tag
         for epc, data in list(pending_api.items()):
             if data.get("race_id") is None:
-                continue
-            if (now - last_sent_at.get(epc, 0)) < dedupe_timeout:
                 continue
             staged_queue.append({
                 "runner_rfid": epc,
@@ -785,8 +771,6 @@ def api_stop_race():
         send_ok, send_err, _ = record_laps(url, key, payload)
         with _state_lock:
             if send_ok:
-                for s in to_send_items:
-                    last_sent_at[s["runner_rfid"]] = now
                 last_upload_error = None
             else:
                 # Re-queue so they aren't lost (upload_worker will retry)
